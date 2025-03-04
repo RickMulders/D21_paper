@@ -1,0 +1,842 @@
+---
+title: "d21_paper_script_fig3_2"
+author: "Rick"
+date: "2024-08-13"
+output: html_document
+---
+
+# Preperation
+```{r 1.1 setup, include=FALSE}
+# Set a standard for all chunk output #
+# ~15 min, 5 GB RAM
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 10)
+```
+
+```{r 1.2 packages, include=FALSE}
+# Generic #
+library(tidyverse)
+library(magrittr)
+library(patchwork)
+library(plotly)
+library(grid)
+library(cluster)
+library(viridis)
+library(ggpubr)
+library(ggrepel)
+
+# Specific #
+library(Seurat)
+library(SeuratObject)
+library(Signac)
+library(sctransform)
+library(pheatmap)
+library(ggupset)
+library(jaccard)
+library(igraph)
+library(ggraph)
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+library(DElegate)
+```
+
+```{r}
+# data directory #
+dirs <- list.dirs("Project/work/directory/")
+
+# select and name relevant directories #
+dirs <- dirs[which(str_detect(dirs,".*/d21/.*|.*/supportfiles"))]
+dirs <- as.list(paste0(dirs,"/")) # ending in forward slash makes it easier to add file names in this script
+names(dirs) <- c("counts", "countmatrix", "processed", "results", "images", "tables", "supportfiles")
+```
+
+```{r, eval=F}
+# load data
+d21 <- readRDS(paste0(dirs$processed,"d21_Seurat3_clustered.rds"))
+```
+
+```{r, eval=F}
+## Signac function Gene activity sum of ATAC fragments in range gene length and -2 KB from TSS
+d21.ATAC_gene_activities <- GeneActivity(d21, assay = "ATAC", gene.id = T)
+## Put gene Activity back in Seurat object as an assay
+d21[["ACTIVITY"]] <- CreateAssayObject(counts = d21.ATAC_gene_activities)
+## Normalize Activity raw count
+d21 <- NormalizeData(d21, assay = "ACTIVITY", normalization.method = "LogNormalize", scale.factor = median(d21$nCount_RNA))
+```
+
+```{r, eval=F}
+# save Seurat object with the new activity assay
+saveRDS(d21, file = paste0(dirs$processed,"d21_Seurat5_activity.rds"))
+```
+
+```{r, eval=T}
+# load data with activity assay, skip previous 3 chunks.
+d21 <- readRDS(paste0(dirs$processed,"d21_Seurat5_activity.rds"))
+```
+
+# figure 3
+
+## data generation and formatting
+
+### Q4 average expression and activity
+```{r}
+# Gene Expression
+
+## get average normalized expression per cluster
+d21_avgexpr <- as.data.frame(AverageExpression(d21, assays = "SCT", group.by = "wsnn_res.0.5")[["SCT"]]) %>%
+  rename_all(~gsub("g","C",.))
+
+## select q4 expressed genes per cluster
+d21_avgexpr.q4 <- as.data.frame(lapply(d21_avgexpr, function(x){
+  setNames(ifelse(x > quantile(x, probs = .75),1,0), rownames(d21_avgexpr))
+}))
+
+## remove genes not in q4 expression of any clusters (disregarded for Jaccard similarity anyway and speeds up computing)
+d21_avgexpr.q4 <- d21_avgexpr.q4[which(rowSums(d21_avgexpr.q4) > 0),] %>%
+  rownames_to_column(var = "ensembl")
+```
+
+```{r}
+# Gene Activity
+
+## get Average Gene activity
+d21_avgact <- as.data.frame(AverageExpression(d21, assays = "ACTIVITY", group.by = "wsnn_res.0.5")[["ACTIVITY"]])
+names(d21_avgact) <- str_replace_all(names(d21_avgact), "g", "C")
+
+## select q4 active genes per cluster
+d21_avgact.q4 <- as.data.frame(lapply(d21_avgact, function(x){
+  setNames(ifelse(x > quantile(x, probs = .75),1,0), rownames(d21_avgact))
+}))
+
+## remove genes not in q4 activity of any clusters (disregarded for Jaccard similarity anyway and speeds up computing)
+d21_avgact.q4 <- d21_avgact.q4[which(rowSums(d21_avgact.q4) > 0),] %>%
+  rownames_to_column(var = "ensembl")
+```
+
+```{r}
+# Combine Gene Expression and Activity
+
+## check if q4 in both expression and activity
+d21_q4_expr_act.list <- list()
+for(i in names(d21_avgexpr.q4)[-1]){
+  d21_q4_expr_act.list[[i]] <- data.frame(ensembl = intersect(d21_avgact.q4[d21_avgact.q4[[i]] == 1,]$ensembl, d21_avgexpr.q4[d21_avgexpr.q4[[i]] == 1,]$ensembl),
+                                          cluster = i)
+}
+
+### bind list together in data frame of q4 expressed and active genes
+d21_q4_expr_act <- bind_rows(d21_q4_expr_act.list)
+
+## generate data frame with binaries per cluster of q4 expressed and active genes
+d21_q4_expr_act.bin <- d21_q4_expr_act %>%
+  mutate(value = 1) %>%
+  pivot_wider(names_from = cluster, values_from = value, values_fill = 0) %>%
+  column_to_rownames(var = "ensembl")
+```
+
+```{r}
+# Formatting data for upset plot
+d21_q4_expr_act.upsetdata <- d21_q4_expr_act %>%
+  group_by(ensembl) %>%
+  dplyr::summarise(clusters = list(cluster)) %>%
+  merge(d21@misc$featurenames_RNA[1:2], by = "ensembl")
+```
+
+```{r}
+# list of genes per overlap category between clusters
+
+## data frame of categories each gene belongs to
+d21_q4_expr_act.bin_genes <- d21_q4_expr_act.upsetdata %>%
+  mutate(clusters = unlist(lapply(clusters,paste,collapse = "_"))) %>%
+  group_by(clusters)
+
+## split data frame into data frames per category
+d21_q4_expr_act.bin_genes.list <- group_split(d21_q4_expr_act.bin_genes)
+## name list elements by category
+names(d21_q4_expr_act.bin_genes.list) <- group_keys(d21_q4_expr_act.bin_genes)[[1]]
+```
+
+```{r eval=F}
+# run jaccard similarity test and save relevant output
+d21_q4_expr_act.jacscores <- data.frame()
+for(i in names(d21_q4_expr_act.bin)){
+  for(j in names(d21_q4_expr_act.bin)){
+    message(paste("\r comparing",i,"to",j), appendLF = F)
+    n_overlap <- sum(d21_q4_expr_act.bin[[i]] == 1 & d21_q4_expr_act.bin[[j]] == 1)
+    jac_test <- jaccard.test.mca(d21_q4_expr_act.bin[[i]], d21_q4_expr_act.bin[[j]])
+    jac_summary <- data.frame(c1       = i,
+                              c2       = j,
+                              overlap  = n_overlap,
+                              stat     = jac_test$statistic,
+                              estim    = jac_test$expectation,
+                              sim      = jac_test$statistic + jac_test$expectation,
+                              pval     = jac_test$pvalue,
+                              FDR      = p.adjust(jac_test$pvalue, method = "BH", n = length(names(d21_q4_expr_act.bin)))
+                              )
+    d21_q4_expr_act.jacscores <- rbind(d21_q4_expr_act.jacscores, jac_summary)
+  }
+}
+
+## Save jaccard data frame to save computing time in future runs
+write.csv(d21_q4_expr_act.jacscores,file = paste0(dirs$tables,"d21_q4_expr_act_jac.csv"), row.names = F)
+```
+
+```{r}
+# load jaccard data frame to save computing time
+d21_q4_expr_act.jacscores <- read.csv(paste0(dirs$tables,"d21_q4_expr_act_jac.csv"), header = T)
+d21_q4_expr_act.jacscores$FDR <- p.adjust(d21_q4_expr_act.jacscores$pval, method = "BH", n = nrow(d21_q4_expr_act.jacscores))
+d21_q4_expr_act.jacscores$sc <- ifelse(d21_q4_expr_act.jacscores$c1 %in% c("C1", "C5", "C8"), "SC-A",
+                                       ifelse(d21_q4_expr_act.jacscores$c1 %in% c("C0", "C2", "C3", "C4", "C6", "C7"), "SC-B", "SC-C"))
+```
+
+```{r}
+# Graph for force directed plotting
+
+## lowest highest cluster edge weight
+d21_q4_expr_act.cutoff = 1
+for(i in d21_q4_expr_act.jacscores$c1){
+  c1_max <- max(d21_q4_expr_act.jacscores[d21_q4_expr_act.jacscores$c1 == i & d21_q4_expr_act.jacscores$c2 != i,]$sim)
+  if(c1_max < d21_q4_expr_act.cutoff){
+    d21_q4_expr_act.cutoff <- c1_max
+  }
+}
+
+d21_q4_expr_act.graph.attr <- unique(d21_q4_expr_act.jacscores[c("c1","sc")])
+## Make graph, cut edges at lowest highest cluster edge weight & FDR < 0.05
+d21_q4_expr_act.graph <- graph_from_data_frame(d = d21_q4_expr_act.jacscores[d21_q4_expr_act.jacscores$sim >= d21_q4_expr_act.cutoff & d21_q4_expr_act.jacscores$FDR < 0.05,], vertices = d21_q4_expr_act.graph.attr, directed = F)
+```
+
+### Q4 average expression and activity for super clusters (sc)
+```{r}
+# Sort cells into super clusters and set as active identity
+
+## defining super clusters in new Seurat Object metadata column
+d21$supercluster <- ifelse(d21$wsnn_res.0.5 %in% c(1, 5, 8), "SC-A",
+                           ifelse(d21$wsnn_res.0.5 %in% c(0, 2, 3, 4, 6, 7), "SC-B",
+                                  ifelse(d21$wsnn_res.0.5 %in% c(9), "SC-C",
+                                         NA)))
+
+## check cluster to super cluster conversion
+table(d21$wsnn_res.0.5, d21$supercluster)
+
+## count cells per super cluster
+table(d21$supercluster)
+
+## set super cluster as active identity
+Idents(d21) <- "supercluster"
+```
+
+```{r}
+# sc average gene expression
+
+## get average gene expression per super cluster
+d21_avgexpr_sc <- as.data.frame(AverageExpression(d21, assays = "SCT", group.by = "supercluster")[["SCT"]])
+
+## select q4 expressed genes per super cluster
+d21_avgexpr_sc.q4 <- as.data.frame(lapply(d21_avgexpr_sc, function(x){
+  setNames(ifelse(x > quantile(x, probs = .75),1,0), rownames(d21_avgexpr_sc))
+}))
+
+## Remove genes with no q4 expression in any super cluster
+d21_avgexpr_sc.q4 <- d21_avgexpr_sc.q4[which(rowSums(d21_avgexpr_sc.q4) > 0),] %>%
+  rownames_to_column(var = "ensembl")
+```
+
+```{r}
+# sc average gene activity
+
+## get average gene activity per super cluster
+d21_avgact_sc <- as.data.frame(AverageExpression(d21, assays = "ACTIVITY", group.by = "supercluster")[["ACTIVITY"]])
+
+## select q4 active genes per super cluster
+d21_avgact_sc.q4 <- as.data.frame(lapply(d21_avgact_sc, function(x){
+  setNames(ifelse(x > quantile(x, probs = .75),1,0), rownames(d21_avgact_sc))
+}))
+
+## Remove genes with no q4 activity in any super cluster
+d21_avgact_sc.q4 <- d21_avgact_sc.q4[which(rowSums(d21_avgact_sc.q4) > 0),] %>%
+  rownames_to_column(var = "ensembl")
+```
+
+```{r}
+# Combine Gene Expression and Activity
+
+## check if q4 in both expr and activity
+d21_q4_expr_act_sc.list <- list()
+for(i in names(d21_avgexpr_sc.q4)[-1]){
+  d21_q4_expr_act_sc.list[[i]] <- data.frame(ensembl = intersect(d21_avgact_sc.q4[d21_avgact_sc.q4[[i]] == 1,]$ensembl, d21_avgexpr_sc.q4[d21_avgexpr_sc.q4[[i]] == 1,]$ensembl),
+                                             supercluster = i)
+}
+
+### bind list together in data frame of q4 expressed and active genes
+d21_q4_expr_act_sc <- bind_rows(d21_q4_expr_act_sc.list) %>%
+  mutate(supercluster = str_replace(supercluster,"\\.","-"))
+
+## generate data frame with binaries per super cluster of q4 expressed and active genes
+d21_q4_expr_act_sc.bin <- d21_q4_expr_act_sc %>%
+  mutate(value = 1) %>%
+  pivot_wider(names_from = supercluster, values_from = value, values_fill = 0) %>%
+  column_to_rownames(var = "ensembl")
+```
+
+```{r}
+# Formatting data for upset plot
+d21_q4_expr_act_sc.upsetdata <- d21_q4_expr_act_sc %>%
+  group_by(ensembl) %>%
+  dplyr::summarise(superclusters = list(supercluster)) %>%
+  merge(d21@misc$featurenames_RNA[1:2], by = "ensembl")
+```
+
+```{r}
+# list of genes per overlap category between super clusters
+
+## data frame of categories each gene belongs to
+d21_q4_expr_act_sc.bin_genes <- d21_q4_expr_act_sc.upsetdata %>%
+  mutate(superclusters = unlist(lapply(superclusters,paste,collapse = "_"))) %>%
+  group_by(superclusters)
+
+## split data frame into list by super cluster overlap category
+d21_q4_expr_act_sc.bin_genes.list <- group_split(d21_q4_expr_act_sc.bin_genes)
+
+## name list elements by category
+names(d21_q4_expr_act_sc.bin_genes.list) <- group_keys(d21_q4_expr_act_sc.bin_genes)[[1]]
+```
+
+```{r, eval=F}
+# run jaccard similarity
+d21_q4_expr_act_sc.jacscores <- data.frame()
+for(i in names(d21_q4_expr_act_sc.bin)){
+  for(j in names(d21_q4_expr_act_sc.bin)){
+    message(paste("\r comparing",i,"to",j), appendLF = F)
+    n_overlap <- sum(d21_q4_expr_act_sc.bin[[i]] == 1 & d21_q4_expr_act_sc.bin[[j]] == 1)
+    jac_test <- jaccard.test.mca(d21_q4_expr_act_sc.bin[[i]], d21_q4_expr_act_sc.bin[[j]])
+    jac_summary <- data.frame(c1       = i,
+                              c2       = j,
+                              overlap  = n_overlap,
+                              stat     = jac_test$statistic,
+                              estim    = jac_test$expectation,
+                              sim      = jac_test$statistic + jac_test$expectation,
+                              pval     = jac_test$pvalue,
+                              FDR      = p.adjust(jac_test$pvalue, method = "BH", n = length(names(d21_q4_expr_act_sc.bin)))
+                              )
+    d21_q4_expr_act_sc.jacscores <- rbind(d21_q4_expr_act_sc.jacscores, jac_summary)
+  }
+}
+
+## Save jaccard data frame to save computing time in future runs
+write.csv(d21_q4_expr_act_sc.jacscores,file = paste0(dirs$tables,"d21_q4_expr_act_sc_jac.csv"), row.names = F)
+```
+
+```{r}
+# load jaccard data frame to save computing time
+d21_q4_expr_act_sc.jacscores <- read.csv(paste0(dirs$tables,"d21_q4_expr_act_sc_jac.csv"), header = T)
+```
+
+```{r}
+# Make graph, cut edges at FDR < 0.05
+d21_q4_expr_act_sc.graph <- graph_from_data_frame(d = d21_q4_expr_act_sc.jacscores[d21_q4_expr_act_sc.jacscores$FDR < 0.05,], directed = F)
+```
+
+### Differential Expression and Activity between super clusters (sc)
+```{r, eval=F}
+# Differential expression analysis
+
+## set default assay to SCT
+DefaultAssay(d21) <- "SCT"
+
+## pairwise Super Cluster Differential Expression Analysis (deg)
+d21_sc_deg <- findDE(d21,
+                     group_column = "supercluster",
+                     compare      = "all_vs_all",
+                     method       = "edger")
+
+## save to reduce computing time
+write.csv(d21_sc_deg, file = paste0(dirs$tables, "d21_sc_deg.csv"), row.names = T)
+```
+
+```{r}
+# Load pairwise differential expression analysis between super clusters.
+d21_sc_deg <- read.csv(paste0(dirs$tables, "d21_sc_deg.csv"), row.names = 1)
+```
+
+```{r, eval=F}
+# Differential activity analysis
+
+## set default assay to ACTIVITY
+DefaultAssay(d21) <- "ACTIVITY"
+
+## pairwise Super Cluster Differential Activity Analysis (dact)
+d21_sc_dact <- findDE(d21,
+                     group_column = "supercluster",
+                     compare      = "all_vs_all",
+                     method       = "edger")
+
+## save to reduce computing time
+write.csv(d21_sc_dact, file = paste0(dirs$tables, "d21_sc_dact.csv"), row.names = T)
+```
+
+```{r}
+# Load pairwise differential expression analysis between super clusters.
+d21_sc_dact <- read.csv(paste0(dirs$tables, "d21_sc_dact.csv"), row.names = 1)
+```
+
+```{r}
+# Select significantly differentially expressed genes
+d21_sc_deg.sig <- d21_sc_deg %>%
+  dplyr::filter(padj < .05) %>%
+  mutate(fc_direction = factor(ifelse(log_fc > 0, "+", "-"), levels = c("+", "-")),
+         dir_ensembl  = paste(feature, fc_direction, sep = "_"),
+         comp = paste0(str_extract(group2,"(?<=SC.)."),"vs",str_extract(group1,"(?<=SC.).")))
+```
+
+```{r}
+# Select significantly differentially active genes
+d21_sc_dact.sig <- d21_sc_dact %>%
+  dplyr::filter(padj < .05) %>%
+  mutate(fc_direction = factor(ifelse(log_fc > 0, "+", "-"), levels = c("+", "-")),
+         dir_ensembl  = paste(feature, fc_direction, sep = "_"),
+         comp = paste0(str_extract(group2,"(?<=SC.)."),"vs",str_extract(group1,"(?<=SC.).")))
+```
+
+```{r}
+# Select significantly differentially expressed and active genes
+
+## comparisons
+comps <- unique(d21_sc_deg.sig$comp)
+
+## check which genes are both differentially expressed and active
+d21_sc_deg_dact.list <- list()
+for(i in comps){
+  d21_sc_deg_dact.list[[i]] <- data.frame(dir_ensembl = intersect(d21_sc_deg.sig[d21_sc_deg.sig$comp == i,]$dir_ensembl, d21_sc_dact.sig[d21_sc_dact.sig$comp == i,]$dir_ensembl),
+                                          comp = i)
+}
+
+### merge list into data frame
+d21_sc_deg_dact <- bind_rows(d21_sc_deg_dact.list)
+
+## generate data frame with binaries per super cluster of differentially expressed and active genes
+d21_sc_deg_dact.bin <- d21_sc_deg_dact %>%
+  mutate(value = 1) %>%
+  pivot_wider(names_from = comp, values_from = value, values_fill = 0) %>%
+  column_to_rownames(var = "dir_ensembl")
+```
+```{r}
+table(d21_sc_deg_dact$comp)
+```
+
+```{r}
+# Formatting data for upset plot
+d21_sc_deg_dact.upsetdata <- d21_sc_deg_dact %>%
+  separate(dir_ensembl, sep = "_",into = c("ensembl","fc_direction")) %>%
+  mutate(fc_direction = factor(fc_direction, levels = c("+","-"))) %>%
+  group_by(ensembl, fc_direction) %>%
+  summarise(comparisons = list(comp)) %>%
+  merge(d21@misc$featurenames_RNA[1:2], by = "ensembl")
+```
+
+```{r}
+# list of genes per overlap category between super clusters
+
+## data frame of categories each gene belongs to
+d21_sc_deg_dact.bin_genes <- d21_sc_deg_dact.upsetdata %>%
+  mutate(comparisons = unlist(lapply(comparisons,paste,collapse = "_"))) %>%
+  group_by(comparisons)
+
+## split data frame into data frames per category
+d21_sc_deg_dact.bin_genes.list <- group_split(d21_sc_deg_dact.bin_genes)
+
+## name list elements by category
+names(d21_sc_deg_dact.bin_genes.list) <- group_keys(d21_sc_deg_dact.bin_genes)[[1]]
+```
+
+```{r, eval=F}
+# run jaccard similarity
+d21_sc_deg_dact.jacscores <- data.frame()
+for(i in names(d21_sc_deg_dact.bin)){
+  for(j in names(d21_sc_deg_dact.bin)){
+    message(paste("\r comparing",i,"to",j), appendLF = F)
+    n_overlap <- sum(d21_sc_deg_dact.bin[[i]] == 1 & d21_sc_deg_dact.bin[[j]] == 1)
+    jac_test <- jaccard.test.mca(d21_sc_deg_dact.bin[[i]], d21_sc_deg_dact.bin[[j]])
+    jac_summary <- data.frame(c1      = str_replace_all(i, "SC_",""),
+                              c2      = str_replace_all(j, "SC_",""),
+                              overlap = n_overlap,
+                              stat    = jac_test$statistic,
+                              estim   = jac_test$expectation,
+                              sim     = jac_test$statistic + jac_test$expectation,
+                              pval    = jac_test$pvalue,
+                              padj    = p.adjust(jac_test$pvalue, method = "BH", length(names(d21_sc_deg_dact.bin))))
+    d21_sc_deg_dact.jacscores <- rbind(d21_sc_deg_dact.jacscores, jac_summary)
+  }
+}
+
+## Save to reduce computing time
+write.csv(d21_sc_deg_dact.jacscores,file = paste0(dirs$tables,"d21_sc_deg_dact_jac.csv"), row.names = F)
+```
+
+```{r}
+# load jaccard data frame to save computing time
+d21_sc_deg_dact.jacscores <- read.csv(paste0(dirs$tables,"d21_sc_deg_dact_jac.csv"), header = T)
+```
+
+```{r}
+# graph of differentially expressed and active genes between super clusters
+
+## lowest highest cluster edge weight
+d21_sc_deg_dact.cutoff = 1
+for(i in d21_sc_deg_dact.jacscores$c1){
+  c1_max <- min(d21_sc_deg_dact.jacscores[d21_sc_deg_dact.jacscores$c1 == i & d21_sc_deg_dact.jacscores$c2 != i,]$sim)
+  if(c1_max < d21_sc_deg_dact.cutoff){
+    d21_sc_deg_dact.cutoff <- c1_max
+  }
+}
+
+## Make graph, cut edges at 0 similarity & pval < 0.05
+d21_sc_deg_dact.graph <- graph_from_data_frame(d = d21_sc_deg_dact.jacscores[d21_sc_deg_dact.jacscores$sim > 0 & d21_sc_deg_dact.jacscores$padj < 0.05,], directed = F)
+```
+
+```{r}
+# combine three binds of genes inidcating common direction, then split by fold change direction
+d21_sc_deg_dact.BvsA_CvsA_CvsB.list <- bind_rows(d21_sc_deg_dact.bin_genes.list$BvsA_CvsA,
+                                                 d21_sc_deg_dact.bin_genes.list$CvsA_CvsB,
+                                                 d21_sc_deg_dact.bin_genes.list$BvsA_CvsA_CvsB) %>%
+  group_by(fc_direction) %>%
+  group_split()
+
+## name dfs in list
+names(d21_sc_deg_dact.BvsA_CvsA_CvsB.list) <- c("up","down")
+```
+
+```{r, eval=FALSE}
+d21_q4_expr_act.bin_genes.bin <- d21_q4_expr_act.bin_genes %>%
+  separate_longer_delim(clusters, "_") %>%
+  mutate(seen = 1) %>%
+  pivot_wider(id_cols = c( "ensembl", "gene"), names_from = "clusters", values_from = seen, values_fill = 0) %>%
+  dplyr::select(ensembl, gene, C0, C1, C2, C3, C4, C5, C6, C7, C8, C9)
+
+d21_q4_expr_act_sc.bin_genes.bin <- d21_q4_expr_act_sc.bin_genes %>%
+  separate_longer_delim(superclusters, "_") %>%
+  mutate(seen = 1) %>%
+  pivot_wider(id_cols = c( "ensembl", "gene"), names_from = "superclusters", values_from = seen, values_fill = 0)
+
+d21_sc_deg_dact.bin_genes.bin <- d21_sc_deg_dact.bin_genes %>%
+  separate_longer_delim(comparisons, "_") %>%
+  mutate(seen = 1) %>%
+  pivot_wider(id_cols = c( "ensembl", "gene", "fc_direction"), names_from = "comparisons", values_from = seen, values_fill = 0)
+
+write.table(d21_q4_expr_act.bin_genes.bin, file = paste0(dirs$tables,"d21_c_q4_bins.tsv"), sep = "\t", row.names = F, quote = F)
+write.table(d21_q4_expr_act_sc.bin_genes.bin, file = paste0(dirs$tables,"d21_sc_q4_bins.tsv"), sep = "\t", row.names = F, quote = F)
+write.table(d21_sc_deg_dact.bin_genes.bin, file = paste0(dirs$tables,"d21_sc_deg_dact_bins.tsv"), sep = "\t", row.names = F, quote = F)
+```
+
+### Linearity
+```{r, eval=F}
+# Test the application of a linear model on 3 different hypotheses of supercluster expression organisation.
+d21_normexpr <- GetAssayData(d21, assay = "SCT", layer = "scale.data")                                                      # Expression matrix
+d21_lin_list <- lapply(rownames(d21_normexpr), function(x){                                                                 # Do this for all genes(rows) in expression matrix
+  message(paste("\rProcessing:", x , which(rownames(d21_normexpr) == x), "/", nrow(d21_normexpr), sep = " "), appendLF = F) # track progress
+  gene_normexpr <- as.data.frame(d21_normexpr[x,])                                                                          # expression per for gene x
+  names(gene_normexpr) <- "normexpr"                                                                                        # rename normalized gene expression column
+  x_expr <- merge(d21@meta.data["supercluster"], gene_normexpr, by = "row.names") %>%                                       #        order:  0 - 1 - 2
+    mutate(h1 = ifelse(supercluster == "SC-A", 0, ifelse(supercluster == "SC-B", 1, 2)),                                    # Hypothesis 1:  A - B - C
+           h2 = ifelse(supercluster == "SC-B", 0, ifelse(supercluster == "SC-A", 1, 2)),                                    # Hypothesis 2:  B - A - C
+           h3 = ifelse(supercluster == "SC-B", 0, ifelse(supercluster == "SC-C", 1, 2)))                                    # Hypothesis 3:  B - C - A
+  x_lm_h1 <- summary(lm(normexpr ~ h1, x_expr))                                                                             # linear model hypothesis 1
+  x_lm_h2 <- summary(lm(normexpr ~ h2, x_expr))                                                                             # linear model hypothesis 2
+  x_lm_h3 <- summary(lm(normexpr ~ h3, x_expr))                                                                             # linear model hypothesis 3
+  x_lin_df <- data.frame(ensembl = x,                                                                                       # gene name
+                         h1_coef = x_lm_h1$coefficients["h1","Estimate"],                                                   # linear model coefficient (alpha) hypothesis 1
+                         h1_pval = x_lm_h1$coefficients["h1","Pr(>|t|)"],                                                   # linear model p value hypothesis 1
+                         h1_rse  = x_lm_h1$sigma,                                                                           # Residual Standard Error hypothesis 1
+                         h2_coef = x_lm_h2$coefficients["h2","Estimate"],                                                   # linear model coefficient (alpha) hypothesis 2
+                         h2_pval = x_lm_h2$coefficients["h2","Pr(>|t|)"],                                                   # linear model p value hypothesis 2
+                         h2_rse  = x_lm_h2$sigma,                                                                           # Residual Standard Error hypothesis 2
+                         h3_coef = x_lm_h3$coefficients["h3","Estimate"],                                                   # linear model coefficient (alpha) hypothesis 3
+                         h3_pval = x_lm_h3$coefficients["h3","Pr(>|t|)"],                                                   # linear model p value hypothesis 3
+                         h3_rse  = x_lm_h3$sigma)                                                                           # Residual Standard Error hypothesis 3
+})
+d21_lin_df <- bind_rows(d21_lin_list)                                                                                       # list to data frame
+d21_lin_df <- na.omit(d21_lin_df)                                                                                           # remove NA
+
+## save to reduce computing time
+write.csv(d21_lin_df, file = paste0(dirs$tables,"d21_linearity_table_scaledexpr.csv"), row.names = F)
+```
+
+```{r}
+## load to reduce computing time
+d21_lin_df <- read.csv(file = paste0(dirs$tables,"d21_linearity_table_scaledexpr.csv"))
+```
+
+```{r}
+# Cleaned linearity data frame
+d21_lin_df_clean <- d21_lin_df %>%
+  pivot_longer(contains("h")) %>%
+  separate(name, into = c("hypo","data"),sep = "_") %>%
+  pivot_wider(names_from = "data", values_from = "value")
+```
+
+```{r}
+# Get genes per hypothesis and direction
+
+## group by hypothesis and direction
+d21_lin_df_clean.genes_hypo_dir <- d21_lin_df_clean %>%
+  dplyr::filter(pval < 0.05) %>%
+  mutate(dir = ifelse(coef > 0, "+", "-"),
+         hypo_dir = paste(hypo,dir,sep = " ")) %>%
+  group_by(hypo_dir)
+
+## split into list by hypothesis and direction
+d21_lin_df_clean.genes_hypo_dir.list <- group_split(d21_lin_df_clean.genes_hypo_dir)
+
+## name list elements by hypothesis and direction
+names(d21_lin_df_clean.genes_hypo_dir.list) <- group_keys(d21_lin_df_clean.genes_hypo_dir)[[1]]
+```
+
+```{r}
+# GO:BP pathway analysis of genes showing linearity
+
+## GO:BP linearity hypothesis 1 up
+d21_lin_df_clean.ego.h1_up <- enrichGO(gene         = d21_lin_df_clean.genes_hypo_dir.list$`h1 +`$ensembl,
+                                       universe     = d21@misc$featurenames_RNA$ensembl,
+                                       keyType      = "ENSEMBL",
+                                       OrgDb        = org.Hs.eg.db,
+                                       ont          = "BP",
+                                       pvalueCutoff = 0.01,
+                                       qvalueCutoff = 0.05,
+                                       readable     = T)
+
+## GO:BP linearity hypothesis 1 down
+d21_lin_df_clean.ego.h1_down <- enrichGO(gene         = d21_lin_df_clean.genes_hypo_dir.list$`h1 -`$ensembl,
+                                         universe     = d21@misc$featurenames_RNA$ensembl,
+                                         keyType      = "ENSEMBL",
+                                         OrgDb        = org.Hs.eg.db,
+                                         ont          = "BP",
+                                         pvalueCutoff = 0.01,
+                                         qvalueCutoff = 0.05,
+                                         readable     = T)
+```
+
+```{r, eval=FALSE}
+write.table(d21_lin_df_clean.ego.h1_up, file = paste0(dirs$tables,"d21_linearity_h1_up_gobp.tsv"), sep = "\t", row.names = F, quote = F)
+write.table(d21_lin_df_clean.ego.h1_down, file = paste0(dirs$tables,"d21_linearity_h1_down_gobp.tsv"), sep = "\t", row.names = F, quote = F)
+```
+
+```{r}
+select.h1_up <- intersect(d21_lin_df_clean.ego.h1_up@result[d21_lin_df_clean.ego.h1_up@result$p.adjust < 0.05,]$Description,
+          d21_sc_deg_dact.ego.BvsA_CvsA_CvsB_combined.ego.down@result[d21_sc_deg_dact.ego.BvsA_CvsA_CvsB_combined.ego.down@result$p.adjust < 0.05,]$Description)
+
+select.h1_down <- intersect(d21_lin_df_clean.ego.h1_down@result[d21_lin_df_clean.ego.h1_down@result$p.adjust < 0.05,]$Description,
+          d21_sc_deg_dact.ego.BvsA_CvsA_CvsB_combined.ego.up@result[d21_sc_deg_dact.ego.BvsA_CvsA_CvsB_combined.ego.up@result$p.adjust < 0.05,]$Description)
+```
+
+## Construct figures
+
+```{r}
+axis_title_size = 20
+axis_text_size = 17
+```
+
+
+```{r, fig.height=7, fig.width=5}
+# p3.a: Upsetplot of overlap in q4 expressed and active genes between clusters
+p3.a <- ggplot(d21_q4_expr_act.upsetdata, aes(x = clusters)) +
+  geom_bar() +
+  geom_text(stat='count', aes(label=after_stat(count)), vjust=-1, size = 6) +
+  scale_y_continuous(limits = c(0,1250)) +
+  scale_x_upset(n_intersections = 10) +
+  theme_minimal() +
+  theme(axis.title = element_text(size = axis_title_size),
+        axis.text = element_text(size = axis_text_size)) +
+  theme_combmatrix(combmatrix.label.text = element_text(size = axis_text_size))
+p3.a
+```
+
+```{r}
+# p3.b: force directed graph of similarity between q4 expressed and active genes between clusters. edges cut at sim .61 and FDR < 0.05
+p3.b <- ggraph(d21_q4_expr_act.graph, layout = "fr", weights = sim) +
+  geom_edge_link(aes(edge_colour = sim), edge_width = 2) +
+  geom_node_point(aes(fill = sc), size = 10, shape = 21) +
+  geom_node_text(aes(label = name), size = 5) +
+  scale_edge_colour_gradient2(low = "red", high = "darkgreen", mid = "grey75", midpoint = .63) +
+  scale_fill_manual(values = c( "SC-A" = "#DA291CFF","SC-B" = "#56A8CBFF","SC-C" = "#53A567FF")) +
+  labs(title = paste("Jaccard Similarity >", round(d21_q4_expr_act.cutoff, 2),"\nbetween q4 expressed and active genes per cluster"),
+       edge_colour = "Jaccard\nsimilarity",
+       fill = "super cluster") +
+  theme(panel.background = element_rect(fill = "white"),
+        plot.title       = element_text(size = 15, hjust = .5, face = "bold"))
+p3.b
+```
+
+```{r}
+p3.c <- ggplot(d21_q4_expr_act_sc.upsetdata, aes(x = superclusters)) +
+  geom_bar() +
+  geom_text(stat='count', aes(label=after_stat(count)), vjust=-1, size = 6) +
+  scale_y_continuous(limits = c(0,1700)) +
+  scale_x_upset(n_intersections = 20) +
+  theme_minimal() +
+  theme(axis.title = element_text(size = axis_title_size),
+        axis.text = element_text(size = axis_text_size)) +
+  theme_combmatrix(combmatrix.label.text = element_text(size = axis_text_size))
+p3.c
+```
+
+```{r}
+p3.d <- ggraph(d21_q4_expr_act_sc.graph, layout = "auto", weights = sim) +
+  geom_edge_link(aes(edge_colour = sim), edge_width = 2) +
+  geom_node_point(aes(fill = name), size = 10, shape = 21) +
+  scale_edge_colour_gradient(low = "grey75", high = "darkgreen") +
+  scale_fill_manual(values = c( "SC-A" = "#DA291CFF","SC-B" = "#56A8CBFF","SC-C" = "#53A567FF")) +
+  labs(title = paste("Jaccard Similarity between\nq4 expressed and active genes per super cluster"),
+       edge_colour = "Jaccard\nsimilarity",
+       fill = "super cluster") +
+  theme(panel.background = element_rect(fill = "white"),
+        plot.title       = element_text(size = 15, hjust = .5, face = "bold"))
+p3.d
+```
+
+```{r}
+p3.e <- d21_sc_deg_dact.upsetdata %>%
+  dplyr::filter(!comparisons == "BvsA") %>%
+  ggplot(aes(x = comparisons)) +
+    geom_bar(aes(fill = fc_direction), position = "stack") +
+    geom_text(stat = "count", aes(label = after_stat(count)), vjust = -1, size = 6) +
+    scale_y_continuous(limits = c(0,800)) +
+    scale_x_upset(n_intersections = 20) +
+    labs(fill  = "log2FC\ndirection") +
+    theme_minimal() +
+    theme(axis.title = element_text(size = axis_title_size),
+        axis.text = element_text(size = axis_text_size)) +
+    theme_combmatrix(combmatrix.label.text = element_text(size = axis_text_size))
+p3.e
+```
+```{r}
+## Supplementary figure 2
+p3.e.supp <- d21_sc_deg_dact.upsetdata %>%
+  ggplot(aes(x = comparisons)) +
+    geom_bar(aes(fill = fc_direction), position = "stack") +
+    geom_text(stat = "count", aes(label = after_stat(count)), vjust = -1, size = 6) +
+    scale_y_continuous(limits = c(0,6500)) +
+    scale_x_upset(n_intersections = 20) +
+    labs(fill  = "log2FC\ndirection") +
+    theme_minimal() +
+    theme(axis.title = element_text(size = axis_title_size),
+        axis.text = element_text(size = axis_text_size)) +
+    theme_combmatrix(combmatrix.label.text = element_text(size = axis_text_size))
+p3.e.supp
+```
+
+```{r}
+p3.f <- ggraph(d21_sc_deg_dact.graph, layout = "auto", weights = sim) +
+  geom_edge_link(aes(edge_colour = sim), edge_width = 2) +
+  geom_node_point(aes(fill = name), size = 10, shape = 21) +
+  scale_edge_colour_gradient(low = "grey75", high = "darkgreen") +
+  scale_fill_manual(values = c( "BvsA" = "violet","CvsB" = "turquoise","CvsA" = "orange")) +
+  labs(title = paste("Jaccard Similarity > 0, FDR < 0.05\n     between differentially expressed and active genes per supercluster"),
+       edge_colour = "Jaccard\nsimilarity",
+       fill = "super cluster\ncomparison") +
+  theme(panel.background = element_rect(fill = "white"),
+        plot.title       = element_text(size = 15, hjust = .5, face = "bold"))
+p3.f
+```
+
+```{r, fig.height=10, fig.width=7}
+p3.g <- d21_lin_df_clean %>%
+  dplyr::filter(pval < 0.05) %>%
+  ggplot(aes(x = hypo, y = rse, fill = hypo)) +
+  geom_violin(show.legend = F) +
+  geom_pwc(label = "p.signif", method = "wilcox.test", ref.group = "h1", label.size = 5) +
+  stat_summary(fun.y = "mean", geom = "point", show.legend = F) +
+  stat_summary(fun.y = "mean", geom = "text", aes(label = paste0(round(..y..,3))), vjust = -.5, size = 5) +
+  scale_fill_manual(values = c("grey90","grey70","grey50")) +
+  labs(x = "Hypothesis", y = "residual stardard error (RSE)", title = "Comparison of mean RSE of linear genes per hypothesis") +
+  theme_minimal() +
+  theme(axis.title.y = element_text(size = axis_title_size),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = axis_text_size),
+        axis.text.x = element_text(size = axis_title_size, face = "bold"),
+        text = element_text(size = 20),
+        axis.line = element_line(linewidth = 0.5),
+        axis.ticks.y = element_line(linewidth = 0.5))
+p3.g
+```
+
+```{r, fig.height=10, fig.width=7}
+d21_lin_df_clean.ego.h1_up@result$p.adjust# <- format(d21_lin_df_clean.ego.h1_up@result$p.adjust, digits = 3, scientific = T)
+p3.h <- barplot(d21_lin_df_clean.ego.h1_up, showCategory = c("extracellular matrix organization",
+                                                             "Wnt signalling pathway",
+                                                             "ossification",
+                                                             "renal system development",
+                                                             "connective tissue development",
+                                                             "ameboidal-type cell migration",
+                                                             "osteoblast differentiation",
+                                                             "cell substrate adhesion",
+                                                             "epithelial cell proliferation",
+                                                             "cartilage development")) +
+  labs(title = "h1 up")
+p3.h
+```
+
+```{r, fig.height=10, fig.width=7}
+p3.i <- barplot(d21_lin_df_clean.ego.h1_down, showCategory = c("regulation of trans-synaptic signaling",
+                                                               "synapse organization",
+                                                               "regulation of membrane potetnial",
+                                                               "synaptic vesicle cycle",
+                                                               "regulation of neuron projection development",
+                                                               "signal release",
+                                                               "axonogenesis",
+                                                               "dendrite development",
+                                                               "regulation of monoatomic ion transmembrane transport",
+                                                               "calcium ion-regulated exocytosis of neurotransmitter")) +
+  labs(title = "h1 down")
+p3.i
+```
+
+
+```{r, fig.height=15, fig.width=20}
+p3_2.design <- c(
+  area(t = 1, l = 1),
+  area(t = 2, l = 1),
+  area(t = 1, l = 2),
+  area(t = 2, l = 2),
+  area(t = 1, l = 3),
+  area(t = 2, l = 3)
+)
+
+p3_2 <- free(p3.a) + free(p3.b) + p3.c + free(p3.d) + p3.e + free(p3.f) + plot_layout(design = p3_2.design, widths = c(3,2,2)) +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.title = element_blank(),
+        legend.key.size = unit(25,"pt"),
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 15))
+p3_2
+```
+
+```{r, eval=FALSE}
+ggsave(filename = paste0(dirs$images,"d21_paper_fig3.png"), plot = p3_2, device = "png", bg = "white", units = "cm", width = 20, height = 15, scaling = .4)
+```
+
+```{r, fig.height=13, fig.width=15}
+p4_2.a <- p3.g
+p4_2.b <- p3.h
+p4_2.c <- p3.i
+
+p4_2.design <- c(
+  area(t = 1, l = 1, b = 2),
+  area(t = 1, l = 2),
+  area(t = 2, l = 2)
+)
+p4_2 <- p4_2.a + p4_2.b + p4_2.c + plot_layout(design = p4_2.design, widths = c(2,1), heights = c(2,2)) +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.title = element_blank(),
+        legend.title = element_text(size = 17),
+        legend.text = element_text(size = 13),
+        legend.key.size = unit(25,"pt"))
+p4_2
+```
+
+```{r, eval=FALSE}
+ggsave(filename = paste0(dirs$images,"d21_paper_fig4.png"), plot = p4_2, device = "png", bg = "white", units = "cm", width = 20, height = 17, scaling = .4)
+```
+
+```{r}
+sessionInfo()
+```
+

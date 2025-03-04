@@ -1,0 +1,367 @@
+---
+title: "D21_paper_script_fig2"
+author: "Rick"
+date: "2025-02-14"
+output: html_document
+---
+
+# Preperation
+```{r 1.1 setup, include=FALSE}
+# Set a standard for all chunk output #
+# ~15 min, 5 GB RAM
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 10)
+```
+
+```{r 1.2 packages, include=FALSE}
+# Generic #
+library(tidyverse)
+library(magrittr)
+library(patchwork)
+library(plotly)
+library(grid)
+library(cluster)
+library(viridis)
+library(ggpubr)
+library(ggrepel)
+
+# Specific #
+library(Seurat)
+library(SeuratObject)
+library(Signac)
+library(sctransform)
+library(SingleR)
+library(celldex)
+library(pheatmap)
+```
+
+```{r}
+# data directory #
+dirs <- list.dirs("Project/work/directory/")
+
+# select and name relevant directories #
+dirs <- dirs[which(str_detect(dirs,".*/d21/.*|.*/supportfiles"))]
+dirs <- as.list(paste0(dirs,"/")) # ending in forward slash makes it easier to add file names in this script
+names(dirs) <- c("counts", "countmatrix", "processed", "results", "images", "tables", "supportfiles")
+```
+
+```{r 1.3 get directories}
+# load data
+d21.unfilt <- readRDS(paste0(dirs$processed,"d21_Seurat1_prepared.rds"))
+d21 <- readRDS(paste0(dirs$processed,"d21_Seurat3_clustered.rds"))
+```
+
+```{r, fig.width=3, fig.height=5}
+p2.a <- ggplot(d21.unfilt@meta.data, aes(x = nCount_RNA, y = nFeature_RNA)) +
+  geom_point(size = .1, colour = "salmon") +
+  geom_hline(yintercept = c(d21.unfilt@misc$filter_parameters$RNA$min_nFeature_RNA, d21.unfilt@misc$filter_parameters$RNA$max_nFeature_RNA), colour = "turquoise") +
+  labs(x = "counts", y = "features") +
+  scale_x_continuous(breaks = seq(0,100000,50000))+
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.line = element_line(linewidth = .5),
+        axis.text = element_text(size = 15),
+        axis.title = element_text(size = 20))
+p2.a
+```
+
+
+```{r, fig.width=3, fig.height=5}
+p2.b <- ggplot(d21.unfilt@meta.data, aes(x = nFeature_RNA, y = percent.mt)) +
+  geom_point(size = .1, colour = "salmon") +
+  geom_vline(xintercept = c(d21.unfilt@misc$filter_parameters$RNA$min_nFeature_RNA, d21.unfilt@misc$filter_parameters$RNA$max_nFeature_RNA)) +
+  geom_hline(yintercept = d21.unfilt@misc$filter_parameters$RNA$percent.mt_cutoff, colour = "turquoise") +
+  labs(x = "features", y = "mitochondrial RNA %") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.line = element_line(linewidth = .5),
+        axis.text = element_text(size = 15),
+        axis.title = element_text(size = 20))
+p2.b
+```
+
+
+```{r, fig.width=3, fig.height=5}
+p2.c <- ggplot(d21.unfilt@meta.data, aes(x = nFeature_RNA, y = percent.ribo)) +
+  geom_point(size = .1, colour = "salmon") +
+  geom_vline(xintercept = c(d21.unfilt@misc$filter_parameters$RNA$min_nFeature_RNA, d21.unfilt@misc$filter_parameters$RNA$max_nFeature_RNA)) +
+  geom_hline(yintercept = d21.unfilt@misc$filter_parameters$RNA$percent.ribo_cutoff, colour = "turquoise") +
+  labs(x = "features", y = "ribosomal RNA %") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.line = element_line(linewidth = .5),
+        axis.text = element_text(size = 15),
+        axis.title = element_text(size = 20))
+p2.c
+```
+
+```{r, fig.width=3, fig.height=5}
+p2.d <- ggplot(d21.unfilt@meta.data, aes(x = orig.ident, y = atac_peak_region_fragments)) +
+  geom_violin(fill = "salmon") +
+  geom_point(size = .1, position = "jitter") +
+  geom_hline(yintercept = c(d21.unfilt@misc$filter_parameters$ATAC$min_atac_peak_region_fragments,d21.unfilt@misc$filter_parameters$ATAC$max_atac_peak_region_fragments), colour = "turquoise") +
+  labs(y = "peak fragments", x = "Cells") +
+  coord_cartesian(ylim = c(0,50000)) +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.line = element_line(linewidth = .5),
+        axis.text = element_text(size = 15),
+        axis.title = element_text(size = 20),
+        axis.text.x = element_blank())
+p2.d
+```
+
+
+```{r, fig.width=3, fig.height=5}
+p2.e <- ggplot(d21.unfilt@meta.data, aes(x = orig.ident, y = pct_reads_in_peaks)) +
+  geom_violin(fill = "salmon") +
+  geom_point(size = .1, position = "jitter") +
+  geom_hline(yintercept = d21.unfilt@misc$filter_parameters$ATAC$pct_reads_in_peaks_cutoff, colour = "turquoise") +
+  labs(y = "peak fragments %", x = "Cells") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.line = element_line(linewidth = .5),
+        axis.text = element_text(size = 15),
+        axis.title = element_text(size = 20),
+        axis.text.x = element_blank())
+p2.e
+```
+
+
+```{r, fig.width=3, fig.height=2.5}
+p2.f <- TSSPlot(d21.unfilt, assay = "ATAC")
+p2.f <- p2.f +
+  scale_x_continuous(breaks = seq(-1000,1000,1000)) +
+  scale_y_continuous(breaks = seq(0,15,15)) +
+  labs(x = "TSS distance", y = "TSSES") +
+  theme(plot.title = element_blank(),
+        plot.subtitle = element_blank(),
+        strip.text = element_blank(),
+        axis.text = element_text(size = 15),
+        axis.title = element_text(size = 20))
+p2.f
+```
+
+
+```{r, fig.width=3, fig.height=2.5}
+p2.g <- FragmentHistogram(d21.unfilt, assay = "ATAC")
+p2.g <- p2.g +
+  scale_y_continuous(breaks = seq(0,7000,6000)) +
+  labs(x = "Fragment length") +
+  theme(axis.text = element_text(size = 15),
+        axis.title = element_text(size = 20))
+p2.g
+```
+
+```{r, fig.width=10, fig.height=10}
+venn_data <- as.data.frame(table(d21.unfilt$comb_filter)) %>% 
+  mutate(pct = round(Freq / length(Cells(d21.unfilt)) * 100,2)) %>%
+  column_to_rownames(var = "Var1") %>%
+  t() %>% 
+  as.data.frame() %>%
+  mutate(ATAC_tot = ATAC+both,
+         RNA_tot = RNA+both,
+         total = none+ATAC+RNA+both) %>%
+  t() %>%
+  as.data.frame()
+
+venn_data <- venn_data %>%
+  mutate(area = (pi*.5^2)/100*pct,
+         radius = (sqrt(area/pi)))
+
+p2.h <- grobTree(
+  circleGrob(x = .5, y = .5, r = venn_data["total",]$radius, gp = gpar(fill = alpha("grey",.4), lwd = 1)),
+  circleGrob(x = .1 + venn_data["RNA_tot",]$radius, y = .01 + venn_data["RNA_tot",]$radius, r = venn_data["RNA_tot",]$radius, gp = gpar(fill = alpha("red",.4), lwd = 1)),
+  circleGrob(x = .9 - venn_data["ATAC_tot",]$radius, y = .01 + venn_data["ATAC_tot",]$radius, r = venn_data["ATAC_tot",]$radius, gp = gpar(fill = alpha("blue",.4), lwd = 1)),
+  textGrob("REST", x = .5, y = .96, gp = gpar(cex = 4, fontface = 4)),
+  textGrob("RNA", x = .08, y = .45, gp = gpar(cex = 4, fontface = 4)),
+  textGrob("ATAC", x = .92, y = .45, gp = gpar(cex = 4, fontface = 4)),
+  textGrob("CELLS INCLUDED", x = .5, y = .6, gp = gpar(cex = 4, fontface = 4)),
+  textGrob(paste(venn_data["none",]$Freq, "\n", venn_data["none",]$pct, "%", sep = ""), x = .5, y = .87, gp = gpar(cex = 2, fontface = 2)),
+  textGrob(paste(venn_data["RNA",]$Freq, "\n", venn_data["RNA",]$pct, "%", sep = ""), x = .08, y = .35, gp = gpar(cex = 2, fontface = 2)),
+  textGrob(paste(venn_data["ATAC",]$Freq, "\n", venn_data["ATAC",]$pct, "%", sep = ""), x = .92, y = .35, gp = gpar(cex = 2, fontface = 2)),
+  textGrob(paste(venn_data["both",]$Freq, "\n", venn_data["both",]$pct, "%", "\n86.66% overlap", sep = ""), x = .5, y = .45, gp = gpar(cex = 2, fontface = 2)),
+  vp = viewport(height=unit(1 , "snpc"), width=unit(1, "snpc"))
+)
+grid.newpage()
+grid.draw(p2.h)
+```
+
+```{r, fig.width=10, fig.height=10}
+# Get RNA umap coords and metadata
+p2.i.plotdata <- merge(d21@reductions$umap.rna@cell.embeddings, d21@meta.data[,c("wsnn_res.0.5","wsnn_res.0.5_sil")], by = "row.names")
+
+p2.i.plotdata$rnaUMAP_1 <- p2.i.plotdata$rnaUMAP_1*-1
+
+p2.i.labelpos <- data.frame(cluster = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"),
+                            x_pos   = c(-5 ,-2.5,  5 ,  3 , -1 ,-5 ,-4.5,  6 ,-4.5,  2 ),
+                            y_pos   = c( 5 , -7 , -4 ,  3 ,  1 , -3 ,  3 ,  4 ,  0 , 4.5))
+
+p2.i <- ggplot(p2.i.plotdata, aes(x = rnaUMAP_1, y = rnaUMAP_2)) +
+  geom_point(aes(colour = wsnn_res.0.5), size = 3, show.legend = F) +
+  geom_label(data = p2.i.labelpos, aes(x = x_pos, y = y_pos, label = cluster, fill = cluster), show.legend = F, size = 10) +
+  labs(x = "RNA UMAP 1", y = "RNA UMAP 2") +
+  theme(panel.background = element_rect(fill = "white"),
+        panel.grid = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.line = element_line(linewidth = 0.5),
+        axis.title = element_text(size = 20, hjust = 0),)
+p2.i
+```
+
+```{r, fig.width=10, fig.height=10}
+# Get ATAC umap coords and metadata
+p2.j.plotdata <- merge(d21@reductions$umap.atac@cell.embeddings, d21@meta.data[,c("wsnn_res.0.5","wsnn_res.0.5_sil")], by = "row.names")
+
+p2.j.plotdata$atacUMAP_1 <- p2.j.plotdata$atacUMAP_1*-1
+p2.j.plotdata$atacUMAP_2 <- p2.j.plotdata$atacUMAP_2*-1
+
+p2.j.labelpos <- data.frame(cluster = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"),
+                            x_pos   = c(-3 , -2 ,-0.5,  6 ,-0.5, -5 , -3 ,  8 , -3 ,  3 ),
+                            y_pos   = c( 7 , -6 , -3 , -1 ,  0 ,-0.5, 3.5, -2 ,-2.5, 4.5))
+
+p2.j <- ggplot(p2.j.plotdata, aes(x = atacUMAP_1, y = atacUMAP_2)) +
+  geom_point(aes(colour = wsnn_res.0.5), size = 3, show.legend = F) +
+  geom_label(data = p2.j.labelpos, aes(x = x_pos, y = y_pos, label = cluster, fill = cluster), show.legend = F, size = 10) +
+  labs(x = "ATAC UMAP 1", y = "ATAC UMAP 2") +
+  theme(panel.background = element_rect(fill = "white"),
+        panel.grid = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.line = element_line(linewidth = 0.5),
+        axis.title = element_text(size = 20, hjust = 0),)
+p2.j
+```
+
+```{r, fig.width=10, fig.height=10}
+# Get WNN umap coords and metadata
+p2.k.plotdata <- merge(d21@reductions$umap.wnn@cell.embeddings, d21@meta.data[,c("wsnn_res.0.5","wsnn_res.0.5_sil")], by = "row.names")
+p2.k.labelpos <- data.frame(cluster = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"),
+                            x_pos   = c(-2 ,-0.5,  5 ,  5 ,-0.5, -3 , -4 ,  7 , -6 ,  3 ),
+                            y_pos   = c( 7 , -6 , -4 ,  0 ,-0.5, -2 ,  4 , 0.5,  1 ,  4 ))
+
+p2.k <- ggplot(p2.k.plotdata, aes(x = wnnUMAP_1, y = wnnUMAP_2)) +
+  geom_point(aes(colour = wsnn_res.0.5), size = 3, show.legend = F) +
+  geom_label(data = p2.k.labelpos, aes(x = x_pos, y = y_pos, label = cluster, fill = cluster), show.legend = F, size = 10) +
+  labs(x = "WNN UMAP 1", y = "WNN UMAP 2") +
+  theme(panel.background = element_rect(fill = "white"),
+        panel.grid = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.line = element_line(linewidth = 0.5),
+        axis.title = element_text(size = 20, hjust = 0),)
+p2.k
+```
+
+```{r}
+# Load hpca reference
+hpca <- HumanPrimaryCellAtlasData(ensembl = T)
+# Run SingleR
+d21.hpca_sim <- SingleR(test   = GetAssayData(d21, assay = "SCT", slot = "data"),
+                        ref    = hpca,
+                        labels = hpca$label.main)
+d21.hpca_sim.scores <- as.data.frame(d21.hpca_sim$scores, row.names = row.names(d21.hpca_sim)) %>%
+  merge(d21@meta.data["wsnn_res.0.5"], by = "row.names") %>%
+  column_to_rownames(var = "Row.names")
+```
+
+```{r, fig.height=3, fig.width=5}
+# Neuroepithelial Cell score
+p2.l.plotdata <- d21.hpca_sim.scores %>%
+  dplyr::select(Neuroepithelial_cell, wsnn_res.0.5)
+
+p2.l.plotdata$cluster_order <- factor(p2.l.plotdata$wsnn_res.0.5,
+                                      p2.l.plotdata %>%
+                                        group_by(wsnn_res.0.5) %>%
+                                        summarise(mean = mean(Neuroepithelial_cell)) %>%
+                                        arrange(mean) %>%
+                                        pull(wsnn_res.0.5))
+
+p2.l <- ggplot(p2.l.plotdata, aes(x = cluster_order , y = Neuroepithelial_cell, fill = wsnn_res.0.5)) +
+  geom_boxplot(show.legend = F) +
+  labs(x = "Cluster", y = "Neuroepithelial cell") +
+  scale_y_continuous(limits = c(0,0.5)) +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.line = element_line(linewidth = .5),
+        axis.text = element_text(size = 15),
+        axis.title = element_text(size = 20))
+p2.l
+```
+
+
+```{r, fig.height=3, fig.width=5}
+# Chondrocyte score
+p2.m.plotdata <- d21.hpca_sim.scores %>%
+  dplyr::select(Chondrocytes, wsnn_res.0.5)
+
+p2.m.plotdata$cluster_order <- factor(p2.m.plotdata$wsnn_res.0.5,
+                                      p2.m.plotdata %>%
+                                        group_by(wsnn_res.0.5) %>%
+                                        summarise(mean = mean(Chondrocytes)) %>%
+                                        arrange(mean) %>%
+                                        pull(wsnn_res.0.5))
+
+p2.m <- ggplot(p2.m.plotdata, aes(x = cluster_order , y = Chondrocytes, fill = wsnn_res.0.5)) +
+  geom_boxplot(show.legend = F) +
+  labs(x = "Cluster", y = "Chondrocyte") +
+  scale_y_continuous(limits = c(0,0.5)) +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.line = element_line(linewidth = .5),
+        axis.text = element_text(size = 15),
+        axis.title = element_text(size = 20))
+p2.m
+```
+
+```{r, fig.height=25, fig.width=20}
+p2.layout <- "
+AAABBBCCCIIIIIIII
+AAABBBCCCIIIIIIII
+AAABBBCCCIIIIIIII
+AAABBBCCCIIIIIIII
+DDDEEEFFFIIIIIIII
+DDDEEEFFFIIIIIIII
+DDDEEEGGGJJJJJJJJ
+DDDEEEGGGJJJJJJJJ
+HHHHHHHHHJJJJJJJJ
+HHHHHHHHHJJJJJJJJ
+HHHHHHHHHJJJJJJJJ
+HHHHHHHHHJJJJJJJJ
+HHHHHHHHHJJJJJJJJ
+HHHHHHHHHJJJJJJJJ
+HHHHHHHHHKKKKKKKK
+HHHHHHHHHKKKKKKKK
+HHHHHHHHHKKKKKKKK
+#########KKKKKKKK
+LLLLLLLL#KKKKKKKK
+LLLLLLLL#KKKKKKKK
+LLLLLLLL#KKKKKKKK
+LLLLLLLL#KKKKKKKK
+"
+p2 <- p2.a + p2.b + p2.c + p2.d + p2.e + p2.f + p2.g + p2.h + p2.i + p2.j + p2.k + p2.l + p2.m +
+  plot_layout(design = p2.layout) +
+  plot_annotation(tag_levels = "A")
+p2
+```
+
+```{r, eval=FALSE}
+# Figure 2
+ggsave(filename = paste0(dirs$images,"d21_paper_fig2.png"), plot = p2, device = "png", bg = "white", units = "cm", width = 20, height = 25, scaling = .3)
+```
+
+
+```{r, fig.height=7, fig.width=14}
+# Supplementary Figure 1
+DimPlot(d21, reduction = "umap.wnn", group.by = c("wsnn_res.0.05","wsnn_res.0.5"))
+```
+
+```{r}
+# Supplementary Figure 3
+p2.m/p2.l
+```
+
+```{r}
+sessionInfo()
+```
+

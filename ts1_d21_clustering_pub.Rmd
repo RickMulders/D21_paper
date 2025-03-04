@@ -1,0 +1,1997 @@
+---
+title: "TS1_d21_QCtoCluster"
+author: "Rick Mulders"
+date: "`r Sys.Date()`"
+output: html_document: toc: TRUE
+---
+# Chapter 1: Introduction
+
+
+```{r 1.1 setup, include=FALSE}
+# Set a standard for all chunk output #
+# ~15 min, 5 GB RAM
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 10)
+
+# print plots constructed in this script to console #
+printplots <- TRUE
+# save plots constructed in this script to images directory #
+saveplots <- TRUE
+# save Seurat object as .rds objects #
+save.rds <- TRUE
+
+#d21 <- readRDS(paste0(dirs$processed,"d21_Seurat1_prepared.rds")) # use this to skip chapter 2
+#d21 <- readRDS(paste0(dirs$processed,"d21_Seurat2_filtered.rds")) # use this to skip chapters 2 and 3
+#d21 <- readRDS(paste0(dirs$processed,"d21_Seurat3_clustered.rds")) # use this to skip chapters 2, 3, 4, 5, and 6
+```
+
+
+```{r 1.2 packages, include=FALSE}
+# Generic #
+library(tidyverse)
+library(magrittr)
+library(patchwork)
+library(plotly)
+library(grid)
+library(cluster)
+
+# Specific #
+library(Seurat)
+library(SeuratObject)
+library(Signac)
+library(sctransform)
+```
+
+
+```{r 1.3 get directories}
+# data directory #
+dirs <- list.dirs("Project/work/directory/")
+
+# select and name relevant directories #
+dirs <- dirs[which(str_detect(dirs,".*/d21/.*|.*/supportfiles"))]
+dirs <- as.list(paste0(dirs,"/")) # ending in forward slash makes it easier to add file names in this script
+names(dirs) <- c("counts", "countmatrix", "processed", "results", "images", "tables", "supportfiles")
+## ! check for accuracy ! ##
+
+## --------------------------------------------------------------------------------------------------------------------- ##
+#>
+#> data structure (files are in brackets):
+#> 
+#> ./project_202204491
+#>  |
+#>  |__________________
+#>  |           |     |
+#> /workspace  /raw  /archive (hash_project_202204491.md5, Project_202204491_counts.tar.gz, Project_202204491_fastq.tar.gz)
+#>  |           |
+#>  |           |
+#> /dx         /dx <-- one for each TP or combination of TPs: d0, d3, d6, d8, d14, d21, d49
+#>  |           |
+#>  |          /counts (atac_fragments.tsv.gz, atac_fragments.tsv.gz.tbi, per_barcode_metrics.csv)
+#>  |           |
+#>  |          /filtered_feature_bc_matrix (barcodes.tsv.gz  features.tsv.gz matrix.mtx.gz)
+#>  |
+#>  |_________
+#>  |        |
+#> /results /processed
+#>  |
+#>  |_________
+#>  |        |
+#> /images  /tables
+#> 
+#> If you do not have a file structure such as above,
+#> please make a list as follows to be able to run this script.
+#> (remember to end each directory with a forward slash / or double backslash \\)
+#> 
+#> dirs <- list(counts      = "your/raw/data/directory/here/",
+#>              countmatrix = "your/10x/countmatrix/directory/here/",
+#>              processed   = "your/directory/to/put/.rds/files/of/seurat/objects/",
+#>              results     = "your/directory/containing/images/tables/directories/",
+#>              images      = "your/directory/to/put/images/generated/in/this/script/",
+#>              tables      = "your/directory/to/put/tables/generated/in/this/script/")
+## --------------------------------------------------------------------------------------------------------------------- ##
+```
+
+```{r}
+# Create genomic annotations hg 38 for ATAC data.
+
+# library
+library(Signac)
+library(GenomicRanges)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+
+# target directory
+savedir <- "Project/work/directory/supportfiles/"
+
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+seqlevelsStyle(annotations) <- "UCSC"
+saveRDS(annotations, file = paste0(savedir,"EnsDb_hg38_annotations.rds"))
+```
+
+
+# Chapter 2: data preperation
+
+```{r 2.2 Construct Seurat Object}
+# Hg38 annotations (pre-made with separate script: "make_EnsDb_hg38_annotations.R") #
+annotations <- readRDS(paste0(dirs$supportfiles,"EnsDb_hg38_annotations.rds"))
+
+# Count matrix for RNA and ATAC #
+d21.data <- Read10X(data.dir = dirs$countmatrix, gene.column = 1) # gene.column: 1 = ensembl ID, 2 = gene name (default), using ensembl ID is harder to work around but causes less confusion and loss of data. #
+
+# Seurat Object RNA #
+d21 <- CreateSeuratObject(counts       = d21.data$`Gene Expression`,
+                          assay        = "RNA",
+                          project      = "TS1_d21",
+                          min.cells    = 0, 
+                          min.features = 0)
+
+# Seurat Object ATAC (added to the RNA Seurat Object as an assay) #
+d21[["ATAC"]] <- CreateChromatinAssay(counts     = d21.data$Peaks,
+                                      genome     = "hg38",
+                                      sep        = c(":", "-"),
+                                      fragments  = paste0(dirs$counts,"atac_fragments.tsv.gz"),
+                                      annotation = annotations)
+
+# Show Seurat Object properties #
+d21
+```
+
+```{r 2.3 additional metadata}
+# Extending data with Cellranger metadata #
+## load data ##
+CRmeta <- read.csv(paste0(dirs$counts,"per_barcode_metrics.csv"), row.names = 1)
+
+## subset recognised cells ##
+CRmeta <- CRmeta[CRmeta$is_cell == 1,]
+CRmeta$is_cell <- NULL
+
+## Add metadata do Seurat Object and fix the row names ##
+d21@meta.data <- merge(d21@meta.data, CRmeta, by = "row.names")
+rownames(d21@meta.data) <- d21@meta.data$Row.names
+d21@meta.data$Row.names <- NULL
+
+## Check Cellranger metadata ##
+d21@meta.data
+
+# Store gene names and categories. #
+## Load data ##
+features <- read.table(paste0(dirs$countmatrix,"features.tsv.gz"), sep = "\t")
+
+## rename columns ##
+colnames(features) <- c("ensembl", "gene", "type", "chr", "tss", "tes")
+
+## Categorise in booleans + subset to features used in Seurat object (add categories by adding arguments in the dplyr::mutate function.) ##
+features %<>%
+  mutate(MT.genes  = str_detect(gene, "^MT-"), # Mitochondrial genes 
+         Rb.genes  = str_detect(gene, "^RP[SL]"), # Ribosomal genes 
+         s.genes   = gene %in% cc.genes.updated.2019$s.genes, # S phase markers
+         g2m.genes = gene %in% cc.genes.updated.2019$g2m.genes) %>% # G2/Mitosis phase markers
+  filter(ensembl %in% d21@assays$RNA@counts@Dimnames[[1]])
+
+## Add to miscellaneous slot ##
+d21@misc[["featurenames_RNA"]] <- features
+
+## check feature name metadata ##
+d21@misc$featurenames_RNA
+```
+
+```{r 2.4 caluclating QC metrics}
+# RNA QC metrics #
+## Percent Mitochondrial RNA ##
+d21[["percent.mt"]] <- PercentageFeatureSet(d21, features = d21@misc$featurenames_RNA[d21@misc$featurenames_RNA$MT.genes == TRUE, "ensembl"], assay = "RNA")
+
+## Percent Ribosomal RNA ##
+d21[["percent.ribo"]] <- PercentageFeatureSet(d21, features = d21@misc$featurenames_RNA[d21@misc$featurenames_RNA$Rb.genes == TRUE, "ensembl"], assay = "RNA")
+
+# ATAC QC metrics #
+## Nucleosome signal (NS) ##
+d21 <- NucleosomeSignal(d21, assay = "ATAC")
+
+## Transcriptional Start Site (TSS) Enrichment Scores ##
+d21 <- TSSEnrichment(d21, assay = "ATAC", fast = F)
+
+## blacklist ratio and fraction of reads in peaks ##
+d21$pct_reads_in_peaks <- d21$atac_peak_region_fragments/d21$atac_fragments*100
+d21$blacklist_ratio <- FractionCountsInRegion(d21, assay = "ATAC", regions = blacklist_hg38)
+```
+
+# Chapter 3: Selecting High Quality Cells
+
+
+## 3.1 RNA QC
+
+```{r 3.1.1 RNA QC metrics 1, fig.width=20}
+# Construct RNA QC plots #
+## VLN plots ##
+p311.1 <- VlnPlot(d21, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo"), assay = "RNA", ncol = 4)
+
+## Scatter plots ##
+p311.2.1 <- FeatureScatter(d21, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+p311.2.2 <- FeatureScatter(d21, feature1 = "nFeature_RNA", feature2 = "percent.mt")
+p311.2.3 <- FeatureScatter(d21, feature1 = "nFeature_RNA", feature2 = "percent.ribo")
+p311.2 <- p311.2.1 + p311.2.2 + p311.2.3 + plot_layout(guides = "collect")
+
+# print plots #
+if(printplots){
+ print(p311.1)
+ print(p311.2)
+}
+
+# Save plots #
+if(saveplots){
+  ggsave(filename = paste0(dirs$images,"d21_qc_rna_vlnplots.png"),
+         plot     = p311.1,
+         device   = "png",
+         height   = 10,
+         width    = 20,
+         bg       = "white")
+  ggsave(filename = paste0(dirs$images,"d21_qc_rna_scatterplots.png"),
+         plot     = p311.2,
+         device   = "png",
+         height   = 10,
+         width    = 20,
+         bg       = "white")
+}
+```
+
+> Choice 1
+> Base cutoff values are determined by trial and error on test data D21
+
+```{r 3.1.2 RNA QC metrics 2 values, fig.width=20}
+# RNA QC metric cut-off values #
+nFeature_cutoffs <- quantile(d21$nFeature_RNA, probs = c(.1583,.9902))
+percent.mt_cutoff <- quantile(d21$percent.mt, probs = .9949047)
+percent.ribo_cutoff <- quantile(d21$percent.ribo, probs = .7722212)
+```
+
+```{r 3.1.3 RNA QC metrics 2 figurs, fig.width=20}
+# Construct RNA QC plots with cutoffs #
+## vln plots ##
+p313.1.1 <- VlnPlot(d21, features = "nFeature_RNA", assay = "RNA") +
+  geom_hline(yintercept = nFeature_cutoffs, colour = "black")
+p313.1.2 <- VlnPlot(d21, features = "nCount_RNA", assay = "RNA")
+p313.1.3 <- VlnPlot(d21, features = "percent.mt", assay = "RNA") +
+  geom_hline(yintercept = percent.mt_cutoff, colour = "turquoise")
+p313.1.4 <- VlnPlot(d21, features = "percent.ribo", assay = "RNA") +
+  geom_hline(yintercept = percent.ribo_cutoff, colour = "turquoise")
+p313.1 <- p313.1.1 + p313.1.2 + p313.1.3 + p313.1.4 + plot_layout(guides = "collect", ncol = 4)
+## scatter plots ##
+p313.2.1 <- FeatureScatter(d21, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+  geom_hline(yintercept = nFeature_cutoffs, colour = "black")
+p313.2.2 <- FeatureScatter(d21, feature1 = "nFeature_RNA", feature2 = "percent.mt") +
+  geom_vline(xintercept = nFeature_cutoffs, colour = "black") +
+  geom_hline(yintercept = percent.mt_cutoff, colour = "turquoise")
+p313.2.3 <- FeatureScatter(d21, feature1 = "nFeature_RNA", feature2 = "percent.ribo") +
+  geom_vline(xintercept = nFeature_cutoffs, colour = "black") +
+  geom_hline(yintercept = percent.ribo_cutoff, colour = "turquoise")
+p313.2 <- p313.2.1 + p313.2.2 + p313.2.3 + plot_layout(guides = "collect")
+# print plots #
+if(printplots){
+  print(p313.1)
+  print(p313.2)
+}
+# save plots #
+if(saveplots){
+  ggsave(filename = paste0(dirs$images,"d21_qc_rna_cutoffs_vlnplots.png"),
+         plot     = p313.1,
+         device   = "png",
+         height   = 10,
+         width    = 20,
+         bg       = "white")
+  ggsave(filename = paste0(dirs$images,"d21_qc_rna_cutoffs_scatterplots.png"),
+         plot     = p313.2,
+         device   = "png",
+         height   = 10,
+         width    = 20,
+         bg       = "white")
+}
+```
+
+## 3.2 ATAC QC
+
+```{r 3.2.1 ATAC QC metrics 1, fig.width=15}
+# Construct ATAC QC plots #
+## VLN plots ##
+p321.1.1 <- VlnPlot(d21, features = "nCount_ATAC", assay = "ATAC")
+p321.1.2 <- VlnPlot(d21, features = "atac_peak_region_fragments", assay = "ATAC")
+p321.1.3 <- VlnPlot(d21, features = "pct_reads_in_peaks", assay = "ATAC")
+p321.1.4 <- VlnPlot(d21, features = "blacklist_ratio", assay = "ATAC")
+p321.1.5 <- VlnPlot(d21, features = "TSS.enrichment")
+p321.1.6 <- VlnPlot(d21, features = "nucleosome_signal")
+p321.1 <- p321.1.1 + p321.1.2 + p321.1.3 + p321.1.4 + p321.1.5 + p321.1.6 + plot_layout(ncol = 3, guides = "collect")
+
+## Density plot ##
+p321.2 <- DensityScatter(d21, x = "nucleosome_signal", y = "TSS.enrichment")
+
+## histograms ##
+p321.3.1 <- TSSPlot(d21, assay = "ATAC") + NoLegend()
+p321.3.2 <- FragmentHistogram(d21, assay = "ATAC")
+p321.3 <- p321.3.1/p321.3.2
+
+# print plots #
+if(printplots){
+  print(p321.1)
+  print(p321.2)
+  print(p321.3)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename = paste0(dirs$images,"d21_qc_atac_vlnplots.png"),
+         plot     = p321.1,
+         device   = "png",
+         height   = 10,
+         width    = 15,
+         bg       = "white")
+  ggsave(filename = paste0(dirs$images,"d21_qc_atac_densityplots.png"),
+         plot     = p321.2,
+         device   = "png",
+         height   = 10,
+         width    = 10,
+         bg       = "white")
+  ggsave(filename = paste0(dirs$images,"d21_qc_atac_histograms.png"),
+         plot     = p321.3,
+         device   = "png",
+         height   = 10,
+         width    = 10,
+         bg       = "white")
+}
+```
+
+> Choice 2
+> Base values are based on trial and error in test data D21
+
+```{r 3.2.2 ATAC QC metrics 2 cutoff values, fig.width=15}
+## high and low TSS score, low <= 2 < high
+TSS_cutoff <- quantile(d21$TSS.enrichment, probs = .01)
+d21$high.tss <- ifelse(d21$TSS.enrichment > TSS_cutoff, "high TSSES > 1%", "low TSSES < 1%")
+
+## nucleosome grouping NS <= 4, NS > 4
+NS_cutoff <- quantile(d21$nucleosome_signal, probs = .99)
+d21$nucleosome_group <- ifelse(d21$nucleosome_signal > NS_cutoff, "high NS > 99%", "low NS < 99%")
+d21$nucleosome_group <- factor(d21$nucleosome_group, levels = c("low NS < 99%","high NS > 99%"))
+
+# more ATAC QC metric cut-off values #
+atac_peak_fragments_cutoff <- quantile(d21$atac_peak_region_fragments, probs = c(.228,.9817))
+pct_reads_in_peaks_cutoff <- quantile(d21$pct_reads_in_peaks, probs = 0.06)
+blacklist_ratio_cutoff <- .05
+```
+
+```{r 3.2.3 ATAC QC metrics 2 plots, fig.width=15}
+# Construct ATAC QC plots with cutoff #
+## vln plots ##
+p323.1.1 <- VlnPlot(d21, features = "nCount_ATAC", assay = "ATAC", group.by = "orig.ident")
+p323.1.2 <- VlnPlot(d21, features = "atac_peak_region_fragments", assay = "ATAC", group.by = "orig.ident") +
+  geom_hline(yintercept = atac_peak_fragments_cutoff)
+p323.1.3 <- VlnPlot(d21, features = "pct_reads_in_peaks", assay = "ATAC", group.by = "orig.ident") +
+  geom_hline(yintercept = pct_reads_in_peaks_cutoff)
+p323.1.4 <- VlnPlot(d21, features = "blacklist_ratio", assay = "ATAC", group.by = "orig.ident") +
+  geom_hline(yintercept = blacklist_ratio_cutoff, colour = "turquoise")
+p323.1.5 <- VlnPlot(d21, features = "TSS.enrichment", group.by = "orig.ident") +
+  geom_hline(yintercept = TSS_cutoff, colour = "turquoise")
+p323.1.6 <- VlnPlot(d21, features = "nucleosome_signal", group.by = "orig.ident") +
+  geom_hline(yintercept = NS_cutoff, colour = "turquoise")
+p323.1 <- p323.1.1 + p323.1.2 + p323.1.3 + p323.1.4 + p323.1.5 + p323.1.6 + plot_layout(ncol = 3, guides = "collect")
+
+## Density plot ##
+p323.2 <- DensityScatter(d21, x = "nucleosome_signal", y = "TSS.enrichment", quantiles = c(1,99))
+
+## Histograms ##
+p323.3.1 <- TSSPlot(d21, group.by = "high.tss", assay = "ATAC") + NoLegend()
+p323.3.2 <- FragmentHistogram(d21, group.by = "nucleosome_group", assay = "ATAC")
+p323.3 <- p323.3.1/p323.3.2
+
+# print plots #
+if(printplots){
+  print(p323.1)
+  print(p323.2)
+  print(p323.3)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename = paste0(dirs$images,"d21_qc_atac_cutoffs_vlnplots.png"),
+         plot     = p323.1,
+         device   = "png",
+         height   = 10,
+         width    = 15,
+         bg       = "white")
+  ggsave(filename = paste0(dirs$images,"d21_qc_atac_cutoffs_densityplots.png"),
+         plot     = p323.3,
+         device   = "png",
+         height   = 10,
+         width    = 20,
+         bg       = "white")
+  ggsave(filename = paste0(dirs$images,"d21_qc_atac_cutoffs_histograms.png"),
+         plot     = p323.3,
+         device   = "png",
+         height   = 10,
+         width    = 20,
+         bg       = "white")
+}
+```
+
+## 3.3 Combined filtering
+
+```{r 3.3.1 Subests for filtering}
+# Store Filter Parameter metadata #
+d21@misc$filter_parameters <- list()
+
+## RNA ##
+d21@misc$filter_parameters$RNA <- list(
+  min_nFeature_RNA = nFeature_cutoffs[1],
+  max_nFeature_RNA = nFeature_cutoffs[2],
+  percent.mt_cutoff = percent.mt_cutoff,
+  percent.ribo_cutoff = percent.ribo_cutoff
+)
+
+## ATAC ##
+d21@misc$filter_parameters$ATAC <- list(
+  min_atac_peak_region_fragments = atac_peak_fragments_cutoff[1],
+  max_atac_peak_region_fragments = atac_peak_fragments_cutoff[2],
+  blacklist_ratio_cutoff = blacklist_ratio_cutoff,
+  pct_reads_in_peaks_cutoff = pct_reads_in_peaks_cutoff,
+  TSS_cutoff = NULL, # No selection on TSS cutoff bottom 1% still follows pattern
+  NS_cutoff = NULL # No selection on NS cutoff top 1% still follows pattern
+)
+
+# High Quality cells in RNA seq #
+RNA_HQ <- WhichCells(d21,
+                     expression =
+                       nFeature_RNA > d21@misc$filter_parameters$RNA$min_nFeature_RNA &
+                       nFeature_RNA < d21@misc$filter_parameters$RNA$max_nFeature_RNA &
+                       percent.mt < d21@misc$filter_parameters$RNA$percent.mt_cutoff &
+                       percent.ribo < d21@misc$filter_parameters$RNA$percent.ribo_cutoff)
+d21$rna_filter <- 0
+d21$rna_filter[RNA_HQ] <- 1
+
+# High Quality cells in ATAC seq #
+ATAC_HQ <-WhichCells(d21,
+                     expression =
+                       atac_peak_region_fragments > d21@misc$filter_parameters$ATAC$min_atac_peak_region_fragments &
+                       atac_peak_region_fragments < d21@misc$filter_parameters$ATAC$max_atac_peak_region_fragments &
+                       blacklist_ratio < d21@misc$filter_parameters$ATAC$blacklist_ratio_cutoff &
+                       pct_reads_in_peaks > d21@misc$filter_parameters$ATAC$pct_reads_in_peaks_cutoff)
+d21$atac_filter <- 0
+d21$atac_filter[ATAC_HQ] <- 2
+
+# High quality in both or one modality #
+d21$comb_filter <- d21$rna_filter + d21$atac_filter
+
+# Factorize categorisation #
+d21$rna_filter <- factor(d21$rna_filter, levels = c(0,1), labels = c("none","RNA"))
+d21$atac_filter <- factor(d21$atac_filter, levels = c(0,2), labels = c("none","ATAC"))
+d21$comb_filter <- factor(d21$comb_filter, levels = c(0,1,2,3), labels = c("none","RNA","ATAC","both"))
+
+# table
+d21_hqcounts <- data.frame(modality = c("total","RNA","ATAC","both"),
+                          count    = c(length(d21$rna_filter),
+                                       sum(d21$rna_filter == "RNA"),
+                                       sum(d21$atac_filter == "ATAC"),
+                                       sum(d21$comb_filter == "both")),
+                          pct      = c(100,
+                                       sum(d21$rna_filter == "RNA")/length(d21$rna_filter)*100,
+                                       sum(d21$atac_filter == "ATAC")/length(d21$atac_filter)*100,
+                                       sum(d21$comb_filter == "both")/length(d21$comb_filter)*100))
+d21_hqcounts
+```
+
+```{r 3.3.2 visualise filter subset categories}
+# Visualise catagories ##
+
+### Scatter plot
+p332.1 <- ggplot(d21@meta.data, aes(x = nFeature_RNA, y = nFeature_ATAC, colour = comb_filter, fill = comb_filter)) +
+  geom_point(shape = 21) +
+  scale_colour_manual(values = c("black","blue","red","purple")) +
+  scale_fill_manual(values = c("white","white","white","purple")) +
+  labs(title = "Selected Cells") +
+  theme_minimal() +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1),
+        axis.text = element_text(size = 15),
+        panel.grid = element_blank(),
+        plot.title = element_text(size = 20, hjust = .5, face = "bold"))
+
+# print plots #
+if(printplots){
+  print(p332.1)
+}
+
+# Save plots #
+if(saveplots){
+  ggsave(filename = paste0(dirs$images,"d21_qc_comb_filter_scatterplot.png"),
+         plot     = p332.1,
+         device   = "png",
+         height   = 10,
+         width    = 10,
+         bg       = "white")
+}
+
+### Venn Diagram
+venn_data <- as.data.frame(table(d21$comb_filter))
+colnames(venn_data)[1] <- "levels"
+venn_data <- mutate(venn_data, pct = round(Freq / length(Cells(d21)) * 100,2)) %>%
+  column_to_rownames(var = "levels")
+
+p332.2 <- grobTree(
+  circleGrob(x = .5, y = .5, r = .5, gp = gpar(fill = alpha("green",.4), lwd = 1)),
+  circleGrob(x = .3, y = .5, r = .3, gp = gpar(fill = alpha("red",.4), lwd = 1)),
+  circleGrob(x = .7, y = .5, r = .3, gp = gpar(fill = alpha("blue",.4), lwd = 1)),
+  textGrob("ALL", x = .5, y = .92, gp = gpar(cex = 3, fontface = 4)),
+  textGrob("RNA", x = .25, y = .6, gp = gpar(cex = 3, fontface = 4)),
+  textGrob("ATAC", x = .75, y = .6, gp = gpar(cex = 3, fontface = 4)),
+  textGrob(paste(venn_data["none",]$Freq, "\n", venn_data["none",]$pct, "%", sep = ""), x = .5, y = .85, gp = gpar(cex = 2, fontface = 2)),
+  textGrob(paste(venn_data["RNA",]$Freq, "\n", venn_data["RNA",]$pct, "%", sep = ""), x = .25, y = .5, gp = gpar(cex = 2, fontface = 2)),
+  textGrob(paste(venn_data["ATAC",]$Freq, "\n", venn_data["ATAC",]$pct, "%", sep = ""), x = .75, y = .5, gp = gpar(cex = 2, fontface = 2)),
+  textGrob(paste(venn_data["both",]$Freq, "\n", venn_data["both",]$pct, "%", sep = ""), x = .5, y = .5, gp = gpar(cex = 2, fontface = 2)),
+  vp = viewport(height=unit(1 , "snpc"), width=unit(1, "snpc"))
+)
+if(printplots){
+grid.newpage()
+grid.draw(p332.2)
+}
+
+if(saveplots){
+  png(filename = paste0(dirs$images,"d21_qc_comb_filter_venndiagram.png"),
+      height = 1080,
+      width = 1080,
+      bg = "white")
+  grid.draw(p332.2)
+  dev.off()
+}
+```
+
+```{r 3.3.3 save Seurat Object, include = FALSE}
+# Save the Seurat Object After preparation #
+if(save.rds){
+  saveRDS(object = d21,
+          file   = paste0(dirs$processed,"d21_Seurat1_prepared.rds"))
+}
+```
+
+```{r 3.3.4 filter}
+# Filter based on QC metrics RNA and ATAC
+d21 <- subset(d21, cells = which(d21$comb_filter == "both"))
+```
+
+
+```{r 3.3.5 filter, include=FALSE}
+# Save the filtered Seurat object
+if(save.rds){
+  saveRDS(object = d21,
+          file = paste0(dirs$processed,"d21_Seurat2_filtered.rds"))
+}
+```
+
+# Chapter 4: single cell RNA cluster analysis
+
+## 4.1 Normalisation
+
+### 4.1.1 Initial Normalisation
+
+```{r 4.1.1.1 RNA SCTransformation}
+# do operations on RNA assay #
+DefaultAssay(d21) <- "RNA"
+
+# Store RNA parameters
+d21@misc$RNA_parameters <- list()
+
+# normalisation 1 #
+d21 <- SCTransform(d21,
+                   vst.flavor = "v2",
+                   return.only.var.genes = F,
+                   verbose = F)
+# store params
+d21@misc$RNA_parameters$normalisation <- list(algorithm = "SCTransform V2", variable.features = "all")
+```
+
+
+```{r 4.1.1.2 RNA QC metrics in PCA, fig.width=11}
+# perform actions on normalised RNA data: SCT #
+DefaultAssay(d21) <- "SCT"
+
+# Dimensional reduction #
+d21 <- RunPCA(d21, features = VariableFeatures(d21))
+
+# Construct RNA QC metrics in PCA plots #
+p4112.1 <- FeaturePlot(d21, reduction = "pca", features = c("nCount_RNA","nFeature_RNA","percent.mt","percent.ribo"), ncol = 2)
+
+# print plots #
+if(printplots){
+  print(p4112.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename = paste0(dirs$images,"d21_qc_features_pca.png"),
+         plot     = p4112.1,
+         device   = "png",
+         height   = 10,
+         width    = 11,
+         bg       = "white")
+}
+```
+
+### 4.1.2 Cell Cycle Score
+
+text(Why Cell Cycle Score?)
+
+```{r 4.1.2.1 Cell Cycle Score}
+# Cell Cycle Score #
+d21 <- CellCycleScoring(d21,
+                         s.features = d21@misc$featurenames_RNA[d21@misc$featurenames_RNA$s.genes,]$ensembl,
+                         g2m.features = d21@misc$featurenames_RNA[d21@misc$featurenames_RNA$g2m.genes,]$ensembl,
+                         set.ident = F) #NOTE: CAN CAUSE ERROR, GO BACK TO CHAPTER 2 BLOCK 2.1! In function CreateSeuratObject(), change argument "min.cells"
+
+# PCA based on cell cycle #
+d21 <- RunPCA(d21, features = c(d21@misc$featurenames_RNA[d21@misc$featurenames_RNA$s.genes,]$ensembl,
+                                d21@misc$featurenames_RNA[d21@misc$featurenames_RNA$g2m.genes,]$ensembl))
+
+# Cell Cycle Difference #
+d21$CC.Difference <- d21$S.Score - d21$G2M.Score
+
+# construct cell cycle plots #
+p4121.1 <- DimPlot(d21, reduction = "pca", group.by = "Phase") + labs(title = "No Cell Cycle correction")
+p4121.2 <- VlnPlot(d21,features = c("S.Score","G2M.Score","CC.Difference"))
+
+# print plots #
+if(printplots){
+  print(p4121.1)
+  print(p4121.2)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename = paste0(dirs$images,"d21_qc_cellcycle_pca_before.png"),
+         plot     = p4121.1,
+         device   = "png",
+         height   = 10,
+         width    = 10,
+         bg       = "white")
+  ggsave(filename = paste0(dirs$images,"d21_qc_cellcycle_vln.png"),
+         plot     = p4121.2,
+         device   = "png",
+         height   = 10,
+         width    = 10,
+         bg       = "white")
+}
+```
+
+### 4.1.3 Regress out undesirable features
+
+> Choice 3
+> QC metric distribution, Cellcycle score or cell cycle difference?
+
+```{r 4.1.3.1 Select variables to regress}
+# Chose which variables to corect for in normalisation
+d21@misc$RNA_parameters$normalisation$regress.variables <- c("S.Score", "G2M.Score", "percent.mt", "percent.ribo")
+```
+
+```{r 4.1.3.2 Normalize with variables to regress}
+# Normalization 2, regress out features with confounding effects; S-phase score, G2/Mitosis-phase score, percentage of ribosomal transcripts #
+d21 <- SCTransform(d21,
+                   vst.flavor = "v2",
+                   return.only.var.genes = F,
+                   vars.to.regress = d21@misc$RNA_parameters$normalisation$regress.variables,
+                   verbose = F)
+
+# Dimensional reduction with cell cycle genes #
+d21 <- RunPCA(d21, features = c(d21@misc$featurenames_RNA[d21@misc$featurenames_RNA$s.genes,]$ensembl,
+                                d21@misc$featurenames_RNA[d21@misc$featurenames_RNA$g2m.genes,]$ensembl))
+# Construct plot with cell cycle data in pca #
+p4132.1 <- DimPlot(d21, reduction = "pca", group.by = "Phase") + labs(title = "Cell Cycle corrected")
+
+# print plots #
+if(printplots){
+  print(p4132.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename = paste0(dirs$images,"d21_qc_cellcycle_pca_after.png"),
+         plot     = p4132.1,
+         device   = "png",
+         height   = 10,
+         width    = 10,
+         bg       = "white")
+}
+```
+
+
+## 4.2 Dimensional Reduction
+
+```{r 4.2.1 Dimensional reduction: PCA}
+# Dimensional Reduction; final PCA #
+DefaultAssay(d21) <- "SCT"
+d21 <- RunPCA(d21)
+
+# Construct RNA QC metrics in PCA plots #
+p421.1.1 <- FeaturePlot(d21, reduction = "pca", features = "nFeature_RNA")
+p421.1.2 <- FeaturePlot(d21, reduction = "pca", features = "percent.mt")
+p421.1.3 <- FeaturePlot(d21, reduction = "pca", features = "percent.ribo")
+p421.1.4 <- DimPlot(d21, reduction = "pca", group.by = "Phase")
+p421.1 <- p421.1.1 + p421.1.2 + p421.1.3 + p421.1.4 + plot_layout(ncol = 2)
+
+# Construct PCA QC Elbow plot #
+p421.2 <- ElbowPlot(d21, ndims = 50)
+
+# Construct Heatmap of dimensions #
+p421.3.1 <- DimHeatmap(d21, dims = 1:15, cells = 200, balanced = T, fast = F, combine = F)
+for(i in 1:15){
+  p421.3.1[[i]] <- p421.3.1[[i]] +
+    labs(title = paste("PC",i)) +
+    theme(axis.text.y = element_blank())
+}
+p421.3 <- wrap_plots(p421.3.1) + plot_layout(guides = "collect")
+
+# Print plots #
+if(printplots){
+  print(p421.1)
+  print(p421.2)
+  print(p421.3)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename = paste0(dirs$images,"d21_qc_pca_qcfeatures_postnorm.png"),
+         plot     = p421.1,
+         device   = "png",
+         height   = 10,
+         width    = 11,
+         bg       = "white")
+  ggsave(filename = paste0(dirs$images,"d21_qc_pca_elbowplot.png"),
+         plot     = p421.2,
+         device   = "png",
+         height   = 10,
+         width    = 10,
+         bg       = "white")
+  ggsave(filename = paste0(dirs$images,"d21_qc_pca_dimheatmap.png"),
+         plot     = p421.3,
+         device   = "png",
+         height   = 10,
+         width    = 10,
+         bg       = "white")
+}
+```
+
+> Choice 4
+
+```{r 4.2.2 PCA Dimensions to use}
+# Specify the upper limit of dimensions to include for further dimensional reduction (UMAP/tSNE) and clustering (SNN) #
+d21@misc$RNA_parameters$PCA_dims <- 15
+
+p422.2 <- p421.2 + geom_vline(xintercept = d21@misc$RNA_parameters$PCA_dims, colour = "red")
+
+if(printplots){
+  print(p422.2)
+}
+
+if(saveplots){
+  ggsave(filename = paste0(dirs$images,"d21_qc_pca_elbowplot.png"),
+           plot     = p422.2,
+           device   = "png",
+           height   = 10,
+           width    = 10,
+           bg       = "white")
+}
+```
+
+```{r 4.2.3 UMAP dimensional reduction 1}
+# Dimensional reduction; UMAP, basic argument settings #
+d21 <- RunUMAP(d21,
+               dims           = 1:d21@misc$RNA_parameters$PCA_dims,
+               n.neighbors    = 50,
+               min.dist       = .3,
+               n.epochs       = 1000,
+               metric         = "cosine",
+               reduction.name = "umap.rna",
+               reduction.key  = "rnaUMAP_",
+               verbose        = F)
+
+# Construct plots of RNA QC metrics in UMAP #
+p423.1.1 <- FeaturePlot(d21, reduction = "umap.rna", features = "nFeature_RNA")
+p423.1.2 <- FeaturePlot(d21, reduction = "umap.rna", features = "percent.mt")
+p423.1.3 <- FeaturePlot(d21, reduction = "umap.rna", features = "percent.ribo")
+p423.1.4 <- DimPlot(d21, reduction = "umap.rna", group.by = "Phase")
+p423.1 <- p423.1.1 + p423.1.2 + p423.1.3 + p423.1.4 + plot_layout(ncol = 2)
+
+# print plots #
+if(printplots){
+  print(p423.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename = paste0(dirs$images,"d21_qc_umap_RNA.png"),
+         plot     = p423.1,
+         device   = "png",
+         height   = 10,
+         width    = 11,
+         bg       = "white")
+}
+```
+
+## 4.3 Clustering
+
+```{r 4.3.1 Clustering, fig.height=100, fig.width=11}
+# find neighbours #
+d21 <- FindNeighbors(d21, dims = 1:d21@misc$RNA_parameters$PCA_dims)
+
+# find clusters in different resolutions #
+
+## resolutions to cluster with ##
+resolutions <- seq(.05,2,.05) # adjust the figure size accordingly. (40 plots 5x5 over 2 columns = height 100)
+
+## List for storing plots ##
+res_plotlist <- list()
+
+## Clustering##
+for(i in resolutions){
+  ### Find clusters for each resolution, these will be added to metadata as; SCT_snn_res.x.x ###
+  d21 <- FindClusters(d21, algorithm = 1, resolution = i, verbose = F)
+  ### Calculate silhouette score for each cluster, these will be added to metadata as; SCT_snn_res.x.x_sil ###
+  sil <- silhouette(as.numeric(d21@meta.data[,paste0("SCT_snn_res.",i)]), dist = dist(d21@reductions$umap.rna@cell.embeddings))
+  if(length(sil) == 1){
+    d21@meta.data[paste0("SCT_snn_res.",i,"_sil")] <- NA
+  } else{
+    d21@meta.data[paste0("SCT_snn_res.",i,"_sil")] <- sil[,3]
+  }
+}
+
+# Store parameters
+d21@misc$RNA_parameters$clustering <- list(algorithm = "louvain", qc = c("silhouette width"), resolution.range = "0.5:2")
+
+# Construct plot with all RNA clusterings in UMAP #
+p431.1 <- DimPlot(d21, reduction = "umap.rna", group.by = names(d21@meta.data)[str_which(names(d21@meta.data),"^SCT_snn_res\\.\\d\\.\\d{1,2}$")], ncol = 2)
+
+# print plots #
+if(printplots){
+  print(p431.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_RNA_umap_snn_res0-2.png"),
+         plot      = p431.1,
+         device    = "png",
+         height    = 100,
+         width     = 11,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+
+```{r 4.3.2 clustering QC, fig.height=5, fig.width=20}
+# Construct barplot to show cell count/cluster #
+p432.1 <- d21@meta.data %>%
+  select(str_which(names(.),"^SCT_snn_res\\.\\d\\.\\d{1,2}(?!_sil)$")) %>%
+  pivot_longer(cols = all_of(names(.))) %>%
+  ggplot(aes(x = name, fill = value)) +
+  geom_bar(stat = "count", position = "dodge", width = .8) +
+  geom_hline(yintercept = 50, colour = "black") +
+  labs(title = "Distribution cells over clusters",
+       fill  = "cluster",
+       x     = "clustering",
+       y     = "cell count") +
+  scale_y_continuous(breaks = seq(0,10000,50)) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 20, hjust = .5, face = "bold"),
+        panel.grid.major.y = element_blank(),
+        axis.text.x = element_text(angle = 90))
+
+# Construct vln plot to show cell count/cluster in WNN #
+p432.2 <- d21@meta.data %>%
+  select(str_which(names(.),"^SCT_snn_res\\.\\d\\.\\d{1,2}_sil$")) %>%
+  pivot_longer(cols = all_of(names(.))) %>%
+  filter(!is.na(value)) %>%
+  ggplot(aes(x = name, y = value)) +
+  geom_violin(show.legend = F, fill = "lightblue", alpha = .5) +
+  geom_pointrange(data = . %>%
+                    group_by(name) %>%
+                    summarise(mean = mean(value),
+                              sd_min = mean - sd(value),
+                              sd_max = mean + sd(value)),
+                  aes(x = name, y = mean, ymin = sd_min, ymax = sd_max, colour = mean >= max(mean)), show.legend = F) +
+  labs(title = "Silhouette score per clustering",
+       x     = "clustering",
+       y     = "silhouette score") +
+  scale_y_continuous(breaks = seq(-1,1,.5)) +
+  scale_colour_manual(values = c("black","red")) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 20, hjust = .5, face = "bold"),
+         axis.text.x = element_text(angle = 90))
+
+# print plots #
+if(printplots){
+  print(p432.1)
+  print(p432.2)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_RNA_umap_snn_res0-2_barplot.png"),
+         plot      = p432.1,
+         device    = "png",
+         height    = 5,
+         width     = 20,
+         bg        = "white",
+         limitsize = F)
+  ggsave(filename  = paste0(dirs$images,"d21_RNA_umap_snn_res0-2_SilhouetteScore.png"),
+         plot      = p432.2,
+         device    = "png",
+         height    = 5,
+         width     = 20,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+> Choice 5
+
+```{r 4.3.3 select clustering resolution}
+# Select the resolution for clustering to continue with.
+d21@misc$RNA_parameters$clustering$resolution = "SCT_snn_res.0.2"
+```
+
+## 4.4 Adjust UMAP parameters
+```{r 4.4.1 apply umap function out is plot}
+# Function to run umap and generate a plot, stores plot for parameters set.
+apply.umap <- function(data, dims = NA, n.neighbors, min.dist, n.epochs, metric, group, test, mode = "RNA"){
+  # dependencies
+  require(tidyverse, quietly = T)
+  require(patchwork, quietly = T)
+  require(Seurat, quietly = T)
+  require(SeuratObject, quietly = T)
+  require(signac, quietly = T)
+  require(cluster, quietly = T)
+  # Check which variable to iterate on
+  if(length(dims) > 1){
+    iterator <- "PCs"
+    iterations <- dims
+    title <- paste0(test," iterate PCs")
+    cap <- paste0("n.neighbors = ",n.neighbors,", min.dist = ",min.dist,", n.epochs = ",n.epochs,", metric = ",metric,", colours = ",group)
+  } else if(length(n.neighbors) > 1){
+    iterator <- "Neighbours"
+    iterations <- n.neighbors
+    title <- paste0(test," iterate Neighbours")
+    cap <- paste0("dimensions = ",dims,", min.dist = ",min.dist,", n.epochs = ",n.epochs,", metric = ",metric,", colours = ",group)
+  } else if(length(min.dist) > 1){
+    iterator <- "Minimal Distance"
+    iterations <- min.dist
+    title <- paste0(test," iterate Minimal Distance")
+    cap <- paste0("dimensions = ",dims,", n.neighbors = ",n.neighbors,", n.epochs = ",n.epochs,", metric = ",metric,", colours = ",group)
+  } else if(length(n.epochs) > 1){
+    iterator <- "Epochs"
+    iterations <- n.epochs
+    title <- paste0(test," iterate Epochs")
+    cap <- paste0("dimensions = ",dims,", n.neighbors = ",n.neighbors,", min.dist = ",min.dist,", metric = ",metric,", colours = ",group)
+  }
+  # prepare data
+  plot_list <- list()
+  silhouette_df <- data@meta.data[paste0(group,"_sil")]
+  names(silhouette_df) <- "base"
+  # per iteration
+  for(i in iterations){
+    # do umap
+    if(mode == "RNA"){
+      data <- RunUMAP(data,
+                      dims        = 1:ifelse(iterator == "PCs", i, dims),
+                      n.neighbors = ifelse(iterator == "Neighbours", i, n.neighbors),
+                      min.dist    = ifelse(iterator == "Minimal Distance", i, min.dist),
+                      n.epochs    = ifelse(iterator == "Epochs", i, n.epochs),
+                      metric      = metric,
+                      assay       = "SCT",
+                      verbose     = FALSE)
+    } else if(mode == "ATAC"){
+      data <- RunUMAP(data,
+                      dims        = 2:ifelse(iterator == "PCs", i, dims),
+                      n.neighbors = ifelse(iterator == "Neighbours", i, n.neighbors),
+                      min.dist    = ifelse(iterator == "Minimal Distance", i, min.dist),
+                      n.epochs    = ifelse(iterator == "Epochs", i, n.epochs),
+                      metric      = metric,
+                      reduction   = "lsi",
+                      assay       = "ATAC",
+                      verbose     = FALSE)
+    } else if(mode == "WNN"){
+      data <- RunUMAP(data,
+                      nn.name     = "weighted.nn",
+                      n.neighbors = ifelse(iterator == "Neighbours", i, n.neighbors),
+                      min.dist    = ifelse(iterator == "Minimal Distance", i, min.dist),
+                      n.epochs    = ifelse(iterator == "Epochs", i, n.epochs),
+                      metric      = metric,
+                      verbose     = FALSE)
+    } else {
+      stop("invalid mode, should be one of 'RNA', 'ATAC', or 'WNN'")
+    }
+    plot_list[[as.character(i)]] <- DimPlot(data, reduction = "umap", group.by = group) +
+      NoLegend() +
+      ggtitle(paste(i,iterator))
+    # do silhouette score
+    sil <- silhouette(as.numeric(data@meta.data[,group]), dist = dist(data@reductions$umap@cell.embeddings))
+    silhouette_df[[as.character(i)]] <- sil[,3]
+  }
+  # make silhouette score plot
+  silplot <- silhouette_df %>%
+    pivot_longer(cols = everything()) %>%
+    mutate(name = factor(name, levels = c(as.character(iterations),"base"))) %>%
+    group_by(name) %>%
+    ggplot(aes(x = name, y = value)) +
+    geom_violin(fill = "lightblue", alpha = .5) +
+    geom_pointrange(data = . %>% summarise(mean = mean(value),
+                                           sd_min = mean - sd(value),
+                                           sd_max = mean + sd(value)),
+                    aes(y = mean, ymin = sd_min, ymax = sd_max, colour = mean >= max(mean)), show.legend = F) +
+    scale_y_continuous(limits = c(-1,1)) +
+    scale_colour_manual(values = c("black","red")) +
+    labs(x = iterator, y = "Silhouette Score") +
+    theme_minimal()
+  # combine plots
+  plot <- wrap_plots(plot_list, ncol = 2) /
+    silplot + plot_layout(heights = c(9,1)) +
+    plot_annotation(title = title,
+                  caption = cap) &
+    theme(plot.title = element_text(size = 20, hjust = .5, face = "bold"))
+  # return object
+  return(plot)
+}
+```
+
+```{r 4.4.2 RNA UMAP PCs, eval=FALSE, fig.height=25, fig.width=11}
+# set eval=FALSE to reduce runtime!
+
+# upper limit for Principal Component inclusion #
+PC_max <- c(5, 10, 20, 25, 30, 35, 40, d21@misc$RNA_parameters$PCA_dims) # NOTE: if two elements are the same, there will be an error.
+
+p442.1 <- apply.umap(data        = d21,
+                     dims        = PC_max,
+                     n.neighbors = 50,
+                     min.dist    = .3,
+                     n.epochs    = 1000,
+                     metric      = "cosine",
+                     group       = d21@misc$RNA_parameters$clustering$resolution,
+                     test        = "d21 RNA",
+                     mode        = "RNA")
+
+p442.2 <- apply.umap(data        = d21,
+                     dims        = c(5,7,9,11,13,15,17,19),
+                     n.neighbors = 50,
+                     min.dist    = .3,
+                     n.epochs    = 1000,
+                     metric      = "cosine",
+                     group       = d21@misc$RNA_parameters$clustering$resolution,
+                     test        = "d21 RNA",
+                     mode        = "RNA")
+
+# print plots #
+if(printplots){
+  print(p442.1)
+  print(p442.2)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_RNA_umap_",d21@misc$RNA_parameters$clustering$resolution,"_PCs1.png"),
+         plot      = p442.1,
+         device    = "png",
+         height    = 25,
+         width     = 11,
+         bg        = "white",
+         limitsize = F)
+  ggsave(filename  = paste0(dirs$images,"d21_RNA_umap_",d21@misc$RNA_parameters$clustering$resolution,"_PCs2.png"),
+         plot      = p442.2,
+         device    = "png",
+         height    = 25,
+         width     = 11,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+```{r 4.4.3 UMAP min.dist, eval=FALSE, fig.height=15, fig.width=10}
+# set eval=FALSE to reduce runtime!
+
+# Minimal Distance parameter #
+min.dists <- c(0.05, 0.1, 0.3, 0.5, 0.7, 1)
+
+p443.1 <- apply.umap(data        = d21,
+                    dims        = d21@misc$RNA_parameters$PCA_dims,
+                    n.neighbors = 50,
+                    min.dist    = min.dists,
+                    n.epochs    = 1000,
+                    metric      = "cosine",
+                    group       = d21@misc$RNA_parameters$clustering$resolution,
+                    test        = "d21 RNA",
+                    mode        = "RNA")
+
+
+# print plots #
+if(printplots){
+  print(p443.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_RNA_umap_",d21@misc$RNA_parameters$clustering$resolution,"_mindist.png"),
+         plot      = p443.1,
+         device    = "png",
+         height    = 15,
+         width     = 10,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+```{r 4.4.4 RNA UMAP n.neighbors, eval=FALSE, fig.height=15, fig.width=10}
+# set eval=FALSE to reduce runtime!
+
+# list of n.neighbors #
+Neighbors <- c(30, 50, 100, 500)
+
+p444.1 <- apply.umap(data        = d21,
+                    dims        = d21@misc$RNA_parameters$PCA_dims,
+                    n.neighbors = Neighbors,
+                    min.dist    = .3,
+                    n.epochs    = 1000,
+                    metric      = "cosine",
+                    group       = d21@misc$RNA_parameters$clustering$resolution,
+                    test        = "d21 RNA",
+                    mode        = "RNA")
+
+# print plots #
+if(printplots){
+  print(p444.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_RNA_umap_",d21@misc$RNA_parameters$clustering$resolution,"_neighbors.png"),
+         plot      = p444.1,
+         device    = "png",
+         height    = 15,
+         width     = 10,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+```{r 4.4.5 RNA UMAP n.epochs, eval=FALSE, fig.height=20, fig.width=10}
+# set eval=FALSE to reduce runtime!
+
+# list of n.epochs #
+epochs <- c(500, 1000, 2000, 5000, 10000)
+
+p445.1 <- apply.umap(data        = d21,
+                    dims        = d21@misc$RNA_parameters$PCA_dims,
+                    n.neighbors = 50,
+                    min.dist    = .3,
+                    n.epochs    = epochs,
+                    metric      = "cosine",
+                    group       = d21@misc$RNA_parameters$clustering$resolution,
+                    test        = "d21 RNA",
+                    mode        = "RNA")
+
+# print plots #
+if(printplots){
+  print(p445.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_RNA_umap_",d21@misc$RNA_parameters$clustering$resolution,"_epochs.png"),
+         plot      = p445.1,
+         device    = "png",
+         height    = 20,
+         width     = 10,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+> Choice 6
+
+```{r 4.4.6}
+# Select best parameters for UMAP
+d21@misc$RNA_parameters$umap.rna <- list(n.neighbors = 100,
+                                        min.dist    = .3,
+                                        n.epochs    = 500,
+                                        metric      = "cosine")
+
+```
+
+
+```{r 4.4.7 final RNA UMAP + QC metrics in umap, fig.width=11, fig.height=11}
+# common subscript
+rna_subscript <- paste0("data = ",Project(d21),", dims = 1:",d21@misc$RNA_parameters$PCA_dims,", n.neighbors = ",d21@misc$RNA_parameters$umap.rna$n.neighbors,", min.dist = ",d21@misc$RNA_parameters$umap.rna$min.dist,", n.epochs = ",d21@misc$RNA_parameters$umap.rna$n.epochs,", metric = ",d21@misc$RNA_parameters$umap.rna$metric)
+
+# UMAP with best parameters #
+d21 <- RunUMAP(d21,
+               dims           = 1:d21@misc$RNA_parameters$PCA_dims,
+               n.neighbors    = d21@misc$RNA_parameters$umap.rna$n.neighbors,
+               min.dist       = d21@misc$RNA_parameters$umap.rna$min.dist,
+               n.epochs       = d21@misc$RNA_parameters$umap.rna$n.epochs,
+               metric         = d21@misc$RNA_parameters$umap.rna$metric,
+               reduction.name = "umap.rna",
+               reduction.key  = "rnaUMAP_",
+               verbose        = F)
+
+# Construct Plots of best RNA results #
+## Clustering in UMAP ##
+p447.1 <- DimPlot(d21, reduction = "umap.rna", group.by = d21@misc$RNA_parameters$clustering$resolution) + plot_annotation(caption = rna_subscript )
+
+## RNA QC metrics in UMAP
+p447.2.1 <- FeaturePlot(d21, reduction = "umap.rna", features = "nFeature_RNA")
+p447.2.2 <- FeaturePlot(d21, reduction = "umap.rna", features = "percent.mt")
+p447.2.3 <- FeaturePlot(d21, reduction = "umap.rna", features = "percent.ribo")
+p447.2.4 <- DimPlot(d21, reduction = "umap.rna", group.by = "Phase")
+p447.2 <- p447.2.1 + p447.2.2 + p447.2.3 + p447.2.4 + plot_layout(ncol = 2) + plot_annotation(caption = rna_subscript )
+
+# print plots #
+if(printplots){
+  print(p447.1)
+  print(p447.2)
+}
+
+# Save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_RNA_umap",d21@misc$RNA_parameters$clustering$resolution,".png"),
+         plot      = p447.1,
+         device    = "png",
+         height    = 10,
+         width     = 11,
+         bg        = "white",
+         limitsize = F)
+  ggsave(filename  = paste0(dirs$images,"d21_RNA_umap_QC_metrics.png"),
+         plot      = p447.2,
+         device    = "png",
+         height    = 10,
+         width     = 11,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+# Chapter 5: single cell ATAC cluster analysis
+
+## 5.1: Normalisation
+
+```{r 5.1.1 atac, fig.width=10, fig.height=5}
+DefaultAssay(d21) <- "ATAC"
+
+# store ATAC parameters
+d21@misc$ATAC_parameters <- list()
+d21@misc$ATAC_parameters$normalisation <- list(algorithm = "LSI", features = "ALL (min.cutoff = 'q0')")
+
+# Normalisation #
+## The combined steps of TF-IDF followed by SVD is known as: Latent Semantic Indexing (LSI)
+d21 <- RunTFIDF(d21)
+d21 <- FindTopFeatures(d21, min.cutoff = "q0")
+d21 <- RunSVD(d21)
+
+# The first LSI component is often technical, this can be checked with the following function.
+## Strong Correlation/anti-correlation means that the majority of variance can be explained by read depth
+p511.1 <- DepthCor(d21, n = 50)
+## This graph suggests such is the case here (corr > 0.5), we should exclude the first dimension from downstream analyses
+
+# print plots #
+if(printplots){
+  print(p511.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_ATAC_LSI_corr_plot.png"),
+       plot      = p511.1,
+       device    = "png",
+       height    = 5,
+       width     = 10,
+       bg        = "white",
+       limitsize = F)
+}
+```
+
+
+> Choice 7
+
+```{r 5.1.2 atac, fig.width=10, fig.height=5}
+# ATAC dimensions #
+d21@misc$ATAC_parameters$LSI_dims <- 16
+
+p512.1 <- p511.1 + geom_vline(xintercept = d21@misc$ATAC_parameters$LSI_dims, colour = "red")
+
+# print plots #
+if(printplots){
+  print(p512.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_ATAC_LSI_corr_plot.png"),
+       plot      = p512.1,
+       device    = "png",
+       height    = 5,
+       width     = 10,
+       bg        = "white",
+       limitsize = F)
+}
+```
+
+## 5.2 Clustering
+```{r 5.2.1 atac, fig.height=100, fig.width=11}
+# make ATAC UMAP, use same parameters as RNA where possible #
+d21 <- RunUMAP(d21,
+                reduction      = "lsi",
+                dims           = 2:d21@misc$ATAC_parameters$LSI_dims,
+                min.dist       = .5,
+                n.neighbors    = 30,
+                n.epochs       = 1000,
+                metric         = "cosine",
+                reduction.name = "umap.atac",
+                reduction.key  = "atacUMAP_",
+                verbose        = F)
+
+# ATAC find neighbours
+d21 <- FindNeighbors(d21, reduction = "lsi", dims = 2:d21@misc$ATAC_parameters$LSI_dims)
+
+# Cluster ATAC with resolutions 0.05 - 2 per 0.05 #
+for(i in resolutions){
+  ### Find clusters for each resolution, these will be added to metadata as; ATAC_snn_res.x.x ###
+  d21 <- FindClusters(d21, algorithm = 3, resolution = i, verbose = F)
+  ### calculate silhouette score for each cluster, these will be added to metadata as; ATAC_snn_res.x.x_sil ###
+  sil <- silhouette(as.numeric(d21@meta.data[,paste0("ATAC_snn_res.",i)]), dist = dist(d21@reductions$umap.atac@cell.embeddings))
+  if(length(sil) == 1){
+    d21@meta.data[paste0("ATAC_snn_res.",i,"_sil")] <- NA
+  } else{
+    d21@meta.data[paste0("ATAC_snn_res.",i,"_sil")] <- sil[,3]
+  }
+}
+
+# Store parameters
+d21@misc$ATAC_parameters$clustering <- list(algorithm = "SLM algorithm", qc = c("silhouette width"), resolution.range = "0.5:2")
+
+# Construct plot with all ATAC clusterings in UMAP #
+p521.1 <- DimPlot(d21, reduction = "umap.atac", group.by = names(d21@meta.data)[str_which(names(d21@meta.data),"^ATAC_snn_res\\.\\d\\.\\d{1,2}$")], ncol = 2)
+
+# print plots #
+if(printplots){
+  print(p521.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_ATAC_dimred_umap_snn_res0-2.png"),
+         plot      = p521.1,
+         device    = "png",
+         height    = 100,
+         width     = 11,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+
+```{r 5.2.2 ATAC clustering QC, fig.height=5, fig.width=20}
+# Construct barplot to show cell count/cluster #
+p522.1 <- d21@meta.data %>%
+  select(str_which(names(.),"^ATAC_snn_res\\.\\d\\.\\d{1,2}(?!_sil)$")) %>%
+  pivot_longer(cols = all_of(names(.))) %>%
+  ggplot(aes(x = name, fill = value)) +
+  geom_bar(stat = "count", position = "dodge", width = .8) +
+  geom_hline(yintercept = 50, colour = "black") +
+  labs(title = "Distribution cells over clusters",
+       fill  = "cluster",
+       x     = "clustering",
+       y     = "cell count") +
+  scale_y_continuous(breaks = seq(0,10000,50)) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 20, hjust = .5, face = "bold"),
+        panel.grid.major.y = element_blank(),
+        axis.text.x = element_text(angle = 90))
+
+# Construct vln plot to show cell count/cluster in WNN #
+p522.2 <- d21@meta.data %>%
+  select(str_which(names(.),"^ATAC_snn_res\\.\\d\\.\\d{1,2}_sil$")) %>%
+  pivot_longer(cols = all_of(names(.))) %>%
+  filter(!is.na(value)) %>%
+  ggplot(aes(x = name, y = value)) +
+  geom_violin(show.legend = F, fill = "lightblue", alpha = .5) +
+  geom_pointrange(data = . %>%
+                    group_by(name) %>%
+                    summarise(mean = mean(value),
+                              sd_min = mean - sd(value),
+                              sd_max = mean + sd(value)),
+                  aes(x = name, y = mean, ymin = sd_min, ymax = sd_max, colour = mean >= max(mean)), show.legend = F) +
+  labs(title = "Silhouette score per clustering",
+       x     = "clustering",
+       y     = "silhouette score") +
+  scale_y_continuous(breaks = seq(-1,1,.5)) +
+  scale_colour_manual(values = c("black","red")) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 20, hjust = .5, face = "bold"),
+         axis.text.x = element_text(angle = 90))
+
+# print plots #
+if(printplots){
+  print(p522.1)
+  print(p522.2)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_ATAC_umap_snn_res0-2_barplot.png"),
+         plot      = p522.1,
+         device    = "png",
+         height    = 5,
+         width     = 20,
+         bg        = "white",
+         limitsize = F)
+  ggsave(filename  = paste0(dirs$images,"d21_ATAC_umap_snn_res0-2_SilhouetteScore.png"),
+         plot      = p522.2,
+         device    = "png",
+         height    = 5,
+         width     = 20,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+> Choice 8
+
+```{r 5.2.3}
+# Select the resolution for clustering to continue with.
+d21@misc$ATAC_parameters$clustering$resolution = "ATAC_snn_res.0.1"
+```
+
+## 5.3 UMAP parameter selection
+
+```{r 5.3.1 ATAC UMAP PCs, eval=FALSE, fig.height=25, fig.width=11}
+# Set eval=TRUE if you plan on using this!
+
+# upper limit for Principal Component inclusion #
+PC_max <- c(5, 15, 20, 25, 30, 35, 40, d21@misc$ATAC_parameters$LSI_dims) # NOTE: if two elements are the same, there will be an error.
+
+p531.1 <- apply.umap(data        = d21,
+                    dims        = PC_max,
+                    n.neighbors = 30,
+                    min.dist    = .5,
+                    n.epochs    = 1000,
+                    metric      = "cosine",
+                    group       = d21@misc$ATAC_parameters$clustering$resolution,
+                    test        = "d21 ATAC",
+                    mode        = "ATAC")
+
+# print plots #
+if(printplots){
+  print(p531.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_ATAC_umap_",d21@misc$ATAC_parameters$clustering$resolution,"_PCs.png"),
+         plot      = p531.1,
+         device    = "png",
+         height    = 25,
+         width     = 11,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+```{r 5.3.2 ATAC UMAP  min.dist, eval=FALSE, fig.height=15, fig.width=10}
+# Set eval=TRUE if you plan on using this!
+
+# Minimal Distance parameter #
+min.dists <- c(0.05, 0.1, 0.3, 0.5, 0.7, 1)
+
+p532.1 <- apply.umap(data        = d21,
+                    dims        = d21@misc$ATAC_parameters$LSI_dims,
+                    n.neighbors = 30,
+                    min.dist    = min.dists,
+                    n.epochs    = 1000,
+                    metric      = "cosine",
+                    group       = d21@misc$ATAC_parameters$clustering$resolution,
+                    test        = "d21 ATAC",
+                    mode        = "ATAC")
+
+
+# print plots #
+if(printplots){
+  print(p532.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_ATAC_umap_",d21@misc$ATAC_parameters$clustering$resolution,"_mindist.png"),
+         plot      = p532.1,
+         device    = "png",
+         height    = 15,
+         width     = 10,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+```{r 5.3.3 ATAC UMAP n.neighbors, eval=FALSE, fig.height=15, fig.width=10}
+# Set eval=TRUE if you plan on using this!
+
+# list of n.neighbors #
+Neighbors <- c(100, 200, 500, 800)
+
+p533.1 <- apply.umap(data        = d21,
+                    dims        = d21@misc$ATAC_parameters$LSI_dims,
+                    n.neighbors = Neighbors,
+                    min.dist    = .5,
+                    n.epochs    = 1000,
+                    metric      = "cosine",
+                    group       = d21@misc$ATAC_parameters$clustering$resolution,
+                    test        = "d21 ATAC",
+                    mode        = "ATAC")
+
+# print plots #
+if(printplots){
+  print(p533.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_ATAC_umap_",d21@misc$ATAC_parameters$clustering$resolution,"_neighbors.png"),
+         plot      = p533.1,
+         device    = "png",
+         height    = 15,
+         width     = 10,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+```{r 5.3.4 ATAC UMAP n.epochs, eval=FALSE, fig.height=20, fig.width=10}
+# Set eval=TRUE if you plan on using this!
+
+# list of n.epochs #
+epochs <- c(500, 1000, 2000, 5000, 10000)
+
+p534.1 <- apply.umap(data        = d21,
+                    dims        = d21@misc$ATAC_parameters$LSI_dims,
+                    n.neighbors = 30,
+                    min.dist    = .5,
+                    n.epochs    = epochs,
+                    metric      = "cosine",
+                    group       = d21@misc$ATAC_parameters$clustering$resolution,
+                    test        = "d21 ATAC",
+                    mode        = "ATAC")
+
+# print plots #
+if(printplots){
+  print(p534.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_ATAC_umap_",d21@misc$ATAC_parameters$clustering$resolution,"_epochs.png"),
+         plot      = p534.1,
+         device    = "png",
+         height    = 20,
+         width     = 10,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+> Choice 9
+
+```{r 5.3.5}
+# Select best parameters for UMAP
+d21@misc$ATAC_parameters$umap.atac <- list(n.neighbors = 200,
+                                           min.dist    = .3,
+                                           n.epochs    = 500,
+                                           metric      = d21@misc$RNA_parameters$umap.rna$metric)
+```
+
+```{r 5.3.6 final ATAC and QC metrics in UMAP, fig.height=10, fig.width=11}
+# common subscript
+atac_subscript <- paste0("data = ",Project(d21),", dims = 2:",d21@misc$ATAC_parameters$LSI_dims,", n.neighbors = ",d21@misc$ATAC_parameters$umap.atac$n.neighbors,", min.dist = ",d21@misc$ATAC_parameters$umap.atac$min.dist,", n.epochs = ",d21@misc$ATAC_parameters$umap.atac$n.epochs,", metric = ",d21@misc$ATAC_parameters$umap.atac$metric)
+
+# final ATAC UMAP
+d21 <- RunUMAP(d21,
+               reduction      = "lsi",
+               dims           = 2:d21@misc$ATAC_parameters$LSI_dims,
+               n.neighbors    = d21@misc$ATAC_parameters$umap.atac$n.neighbors,
+               min.dist       = d21@misc$ATAC_parameters$umap.atac$min.dist,
+               n.epochs       = d21@misc$ATAC_parameters$umap.atac$n.epochs,
+               metric         = d21@misc$ATAC_parameters$umap.atac$metric,
+               reduction.name = "umap.atac",
+               reduction.key  = "atacUMAP_",
+               verbose        = F)
+
+## Clustering in UMAP ##
+p536.1 <- DimPlot(d21, reduction = "umap.atac", group.by = d21@misc$ATAC_parameters$clustering$resolution) + plot_annotation(caption = atac_subscript)
+
+## RNA QC metrics in UMAP
+p536.2.1 <- FeaturePlot(d21, reduction = "umap.atac", features = "atac_peak_region_fragments")
+p536.2.2 <- FeaturePlot(d21, reduction = "umap.atac", features = "TSS.enrichment")
+p536.2.3 <- FeaturePlot(d21, reduction = "umap.atac", features = "nucleosome_signal")
+p536.2.4 <- DimPlot(d21, reduction = "umap.atac", group.by = "Phase")
+p536.2 <- p536.2.1 + p536.2.2 + p536.2.3 + p536.2.4 + plot_layout(ncol = 2) + plot_annotation(caption = atac_subscript)
+
+# print plots #
+if(printplots){
+  print(p536.1)
+  print(p536.2)
+}
+
+# Save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_ATAC_umap",d21@misc$ATAC_parameters$clustering$resolution,".png"),
+         plot      = p536.1,
+         device    = "png",
+         height    = 10,
+         width     = 11,
+         bg        = "white",
+         limitsize = F)
+  ggsave(filename  = paste0(dirs$images,"d21_ATAC_umap_QC_metrics.png"),
+         plot      = p536.2,
+         device    = "png",
+         height    = 10,
+         width     = 11,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+
+# chapter 6: single cell multi modal cluster analysis
+
+## 6.1 Clustering
+
+```{r 6.1.1 WNN clustering, fig.width=11, fig.height=100}
+# Find multimodal Neighbours #
+d21 <- FindMultiModalNeighbors(d21, reduction.list = list("pca", "lsi"), dims.list = list(1:d21@misc$RNA_parameters$PCA_dims, 2:d21@misc$ATAC_parameters$LSI_dims))
+
+# store wnn parameters
+d21@misc$WNN_parameters <- list()
+d21@misc$WNN_parameters$Multimodal_neighbors <- list(reductions = c("PCA","LSI"), dims = setNames(c(1:d21@misc$RNA_parameters$PCA_dims, 2:d21@misc$ATAC_parameters$LSI_dims),c("RNA","ATAC")))
+
+# make UMAP based on multimodal data #
+d21 <- RunUMAP(d21,
+               min.dist       = .5,
+               n.neighbors    = 30,
+               n.epochs       = 1000,
+               metric         = "cosine",
+               nn.name        = "weighted.nn",
+               reduction.name = "umap.wnn",
+               reduction.key  = "wnnUMAP_",
+               verbose        = F)
+
+# Cluster multimodal WNN on louvain resolutions 0.05-2 by 0.05
+for(i in resolutions){
+  ### Find clusters for each resolution, these will be added to metadata as; wsnn_res.x.x ###
+  d21 <- FindClusters(d21, graph.name = "wsnn", algorithm = 3, resolution = i, n.start = 20, n.iter = 20, verbose = F)
+  ### Calculate silhouette score for each cluster, these will be added to metadata as; wsnn_res.x.x_sil ###
+  sil <- silhouette(as.numeric(d21@meta.data[,paste0("wsnn_res.",i)]), dist = dist(d21@reductions$umap.wnn@cell.embeddings))
+  if(length(sil) == 1){
+    d21@meta.data[paste0("wsnn_res.",i,"_sil")] <- NA
+  } else{
+    d21@meta.data[paste0("wsnn_res.",i,"_sil")] <- sil[,3]
+  }
+}
+
+# Store wnn clustering parameters
+d21@misc$WNN_parameters$clustering <- list(algorithm = "SLM algorithm", qc = c("silhouette width"), resolution.range = "0.5:2")
+
+# Construct plot with all WNN clusterings in UMAP #
+p611.1 <- DimPlot(d21, reduction = "umap.wnn", group.by = names(d21@meta.data)[str_which(names(d21@meta.data),"^wsnn_res\\.\\d\\.\\d{1,2}$")], ncol = 2)
+
+# print plots #
+if(printplots){
+  print(p611.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_umap_wsnn_res0-2.png"),
+         plot      = p611.1,
+         device    = "png",
+         height    = 100,
+         width     = 11,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+
+```{r 6.1.2 WNN clustering QC, fig.height=5, fig.width=20}
+# Construct barplot to show cell count/cluster #
+p612.1 <- d21@meta.data %>%
+  select(str_which(names(.),"^wsnn_res\\.\\d\\.\\d{1,2}(?!_sil)$")) %>%
+  pivot_longer(cols = all_of(names(.))) %>%
+  ggplot(aes(x = name, fill = value)) +
+  geom_bar(stat = "count", position = "dodge", width = .8) +
+  geom_hline(yintercept = 50, colour = "black") +
+  labs(title = "Distribution cells over clusters",
+       fill  = "cluster",
+       x     = "clustering",
+       y     = "cell count") +
+  scale_y_continuous(breaks = seq(0,10000,50)) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 20, hjust = .5, face = "bold"),
+        panel.grid.major.y = element_blank(),
+        axis.text.x = element_text(angle = 90))
+
+# Construct vln plot to show cell count/cluster in WNN #
+p612.2 <- d21@meta.data %>%
+  select(str_which(names(.),"^wsnn_res\\.\\d\\.\\d{1,2}_sil$")) %>%
+  pivot_longer(cols = all_of(names(.))) %>%
+  filter(!is.na(value)) %>%
+  ggplot(aes(x = name, y = value)) +
+  geom_violin(show.legend = F, fill = "lightblue", alpha = .5) +
+  geom_pointrange(data = . %>%
+                    group_by(name) %>%
+                    summarise(mean = mean(value),
+                              sd_min = mean - sd(value),
+                              sd_max = mean + sd(value)),
+                  aes(x = name, y = mean, ymin = sd_min, ymax = sd_max, colour = mean >= max(mean)), show.legend = F) +
+  labs(title = "Silhouette score per clustering",
+       x     = "clustering",
+       y     = "silhouette score") +
+  scale_y_continuous(breaks = seq(-1,1,.5)) +
+  scale_colour_manual(values = c("black","red")) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 20, hjust = .5, face = "bold"),
+         axis.text.x = element_text(angle = 90))
+
+# print plots #
+if(printplots){
+  print(p612.1)
+  print(p612.2)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_umap_wsnn_res0-2_barplot.png"),
+         plot      = p612.1,
+         device    = "png",
+         height    = 5,
+         width     = 20,
+         bg        = "white",
+         limitsize = F)
+  ggsave(filename  = paste0(dirs$images,"d21_umap_wsnn_res0-2_SilhouetteScore.png"),
+         plot      = p612.2,
+         device    = "png",
+         height    = 5,
+         width     = 20,
+         bg        = "white",
+         limitsize = F)
+}
+
+```
+
+> Choice 10
+
+```{r 6.1.3}
+# Select the resolution for clustering to continue with.
+d21@misc$WNN_parameters$clustering$resolution = "wsnn_res.0.15"
+```
+
+## 6.2 UMAP parameters
+
+```{r 6.2.1 WNN UMAP min.dist, eval=FALSE, fig.height=15, fig.width=10}
+# Set eval=TRUE if you plan on using this!
+
+# Minimal Distance parameter #
+min.dists <- c(0.05, 0.1, 0.3, 0.5, 0.7, 1)
+
+p621.1 <- apply.umap(data        = d21,
+                    n.neighbors = 30,
+                    min.dist    = min.dists,
+                    n.epochs    = 1000,
+                    metric      = "cosine",
+                    group       = d21@misc$WNN_parameters$clustering$resolution,
+                    test        = "d21 WNN",
+                    mode        = "WNN")
+
+
+# print plots #
+if(printplots){
+  print(p621.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_WNN_umap_",d21@misc$WNN_parameters$clustering$resolution,"_mindist.png"),
+         plot      = p621.1,
+         device    = "png",
+         height    = 15,
+         width     = 10,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+```{r 6.2.2 WNN UMAP n.neighbors, eval=FALSE, fig.height=15, fig.width=10}
+# Set eval=TRUE if you plan on using this!
+
+# list of n.neighbors #
+Neighbors <- c(30, 50, 100, 200)
+
+p622.1 <- apply.umap(data        = d21,
+                    n.neighbors = Neighbors,
+                    min.dist    = .5,
+                    n.epochs    = 1000,
+                    metric      = "cosine",
+                    group       = d21@misc$WNN_parameters$clustering$resolution,
+                    test        = "d21 WNN",
+                    mode        = "WNN")
+
+# print plots #
+if(printplots){
+  print(p622.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_WNN_umap_",d21@misc$WNN_parameters$clustering$resolution,"_neighbors.png"),
+         plot      = p622.1,
+         device    = "png",
+         height    = 15,
+         width     = 10,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+```{r 6.2.3 WNN UMAP n.epochs, eval=FALSE, fig.height=20, fig.width=10}
+# Set eval=TRUE if you plan on using this!
+
+# list of n.epochs #
+epochs <- c(500, 1000, 2000, 5000, 10000)
+
+p623.1 <- apply.umap(data        = d21,
+                    n.neighbors = 30,
+                    min.dist    = .5,
+                    n.epochs    = epochs,
+                    metric      = "cosine",
+                    group       = d21@misc$WNN_parameters$clustering$resolution,
+                    test        = "d21 WNN",
+                    mode        = "WNN")
+
+# print plots #
+if(printplots){
+  print(p623.1)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_WNN_umap_",d21@misc$WNN_parameters$clustering$resolution,"_epochs.png"),
+         plot      = p623.1,
+         device    = "png",
+         height    = 20,
+         width     = 10,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+> Choice 11
+
+```{r 6.2.4 umap.wnn parameter selection}
+# Select best parameters for UMAP
+d21@misc$WNN_parameters$umap.wnn <- list(n.neighbors = 30,
+                                         min.dist    = 0.3,
+                                         n.epochs    = 500,
+                                         metric      = d21@misc$RNA_parameters$umap.rna$metric)
+```
+
+```{r 6.2.5 WNN QC metrics, fig.height=20, fig.width=11}
+# common subscript
+wnn_subscript <- paste0("data = ",Project(d21),", dims = RNA; 1:",d21@misc$RNA_parameters$PCA_dims," ATAC; 2:",d21@misc$ATAC_parameters$LSI_dims,", n.neighbors = ",d21@misc$WNN_parameters$umap.wnn$n.neighbors,", min.dist = ",d21@misc$WNN_parameters$umap.wnn$min.dist,", n.epochs = ",d21@misc$WNN_parameters$umap.wnn$n.epochs,", metric = ",d21@misc$WNN_parameters$umap.wnn$metric)
+
+# final wnn UMAP
+d21 <- RunUMAP(d21,
+               n.neighbors    = d21@misc$WNN_parameters$umap.wnn$n.neighbors,
+               min.dist       = d21@misc$WNN_parameters$umap.wnn$min.dist,
+               n.epochs       = d21@misc$WNN_parameters$umap.wnn$n.epochs,
+               metric         = d21@misc$WNN_parameters$umap.wnn$metric,
+               nn.name        = "weighted.nn",
+               reduction.name = "umap.wnn",
+               reduction.key  = "wnnUMAP_",
+               verbose        = F)
+
+# construct QC metric plot with WNN clustering in umap#
+p625.1.1 <- DimPlot(d21, reduction = "umap.wnn", group.by = d21@misc$WNN_parameters$clustering$resolution)
+p625.1.2 <- FeaturePlot(d21, reduction = "umap.wnn", features = "nFeature_RNA")
+p625.1.3 <- FeaturePlot(d21, reduction = "umap.wnn", features = "percent.mt")
+p625.1.4 <- FeaturePlot(d21, reduction = "umap.wnn", features = "percent.ribo")
+p625.1.5 <- FeaturePlot(d21, reduction = "umap.wnn", features = "atac_peak_region_fragments")
+p625.1.6 <- FeaturePlot(d21, reduction = "umap.wnn", features = "TSS.enrichment")
+p625.1.7 <- FeaturePlot(d21, reduction = "umap.wnn", features = "nucleosome_signal")
+p625.1.8 <- DimPlot(d21, reduction = "umap.wnn", group.by = "Phase")
+p625.1 <- p625.1.1 + p625.1.2 + p625.1.3 + p625.1.4 + p625.1.5 + p625.1.6 + p625.1.7 + p625.1.8 + plot_layout(ncol = 2) + plot_annotation(caption = wnn_subscript)
+
+## Clustering in UMAP ##
+p625.2 <- DimPlot(d21, reduction = "umap.wnn", group.by = d21@misc$WNN_parameters$clustering$resolution) + plot_annotation(caption = wnn_subscript)
+
+# print plots #
+if(printplots){
+  print(p625.1)
+  print(p625.2)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename  = paste0(dirs$images,"d21_WNN_umap_QC_metrics_",d21@misc$WNN_parameters$clustering$resolution,".png"),
+         plot      = p625.1,
+         device    = "png",
+         height    = 20,
+         width     = 11,
+         bg        = "white",
+         limitsize = F)
+  ggsave(filename  = paste0(dirs$images,"d21_WNN_umap_",d21@misc$WNN_parameters$clustering$resolution,".png"),
+         plot      = p625.2,
+         device    = "png",
+         height    = 10,
+         width     = 11,
+         bg        = "white",
+         limitsize = F)
+}
+```
+
+## 6.3 Combined representation
+
+```{r 6.3.1 Visualise WNN in UMAP, fig.width=16, fig.height=6}
+# construct plot with RNA clustering in all umaps #
+p631.1.1 <- DimPlot(d21, reduction = "umap.rna", group.by = d21@misc$RNA_parameters$clustering$resolution, repel = TRUE) + ggtitle("RNA")
+p631.1.2 <- DimPlot(d21, reduction = "umap.atac", group.by = d21@misc$RNA_parameters$clustering$resolution, repel = TRUE) + ggtitle("ATAC")
+p631.1.3 <- DimPlot(d21, reduction = "umap.wnn", group.by = d21@misc$RNA_parameters$clustering$resolution, repel = TRUE) + ggtitle("WNN")
+p631.1 <- p631.1.1 + p631.1.2 + p631.1.3 + plot_layout(nrow = 1, guides = "collect", widths = c(1,1,1)) + plot_annotation(title = "RNA clustering in RNA, ATAC and WNN UMAP") & theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"))
+
+# construct plot with ATAC clustering in all umaps #
+p631.2.1 <- DimPlot(d21, reduction = "umap.rna", group.by = d21@misc$ATAC_parameters$clustering$resolution, repel = TRUE) + ggtitle("RNA")
+p631.2.2 <- DimPlot(d21, reduction = "umap.atac", group.by = d21@misc$ATAC_parameters$clustering$resolution, repel = TRUE) + ggtitle("ATAC")
+p631.2.3 <- DimPlot(d21, reduction = "umap.wnn", group.by = d21@misc$ATAC_parameters$clustering$resolution, repel = TRUE) + ggtitle("WNN")
+p631.2 <- p631.2.1 + p631.2.2 + p631.2.3 + plot_layout(nrow = 1, guides = "collect", widths = c(1,1,1)) + plot_annotation(title = "ATAC clustering in RNA, ATAC and WNN UMAP") & theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"))
+
+# construct plot with WNN clustering in all umaps #
+p631.3.1 <- DimPlot(d21, reduction = "umap.rna", group.by = d21@misc$WNN_parameters$clustering$resolution, repel = TRUE) + ggtitle("RNA")
+p631.3.2 <- DimPlot(d21, reduction = "umap.atac", group.by = d21@misc$WNN_parameters$clustering$resolution, repel = TRUE) + ggtitle("ATAC")
+p631.3.3 <- DimPlot(d21, reduction = "umap.wnn", group.by = d21@misc$WNN_parameters$clustering$resolution, repel = TRUE) + ggtitle("WNN")
+p631.3 <- p631.3.1 + p631.3.2 + p631.3.3 + plot_layout(nrow = 1, guides = "collect", widths = c(1,1,1)) + plot_annotation(title = "WNN clustering in RNA, ATAC and WNN UMAP") & theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"))
+
+# print plots #
+if(printplots){
+  print(p631.1)
+  print(p631.2)
+  print(p631.3)
+}
+
+# save plots #
+if(saveplots){
+  ggsave(filename = paste0(dirs$images,"d21_RNAinALL_umap_",d21@misc$RNA_parameters$clustering$resolution,".png"),
+         plot     = p631.1,
+         device   = "png",
+         height   = 6,
+         width    = 16,
+         bg       = "white")
+  ggsave(filename = paste0(dirs$images,"d21_ATACinALL_umap_",d21@misc$ATAC_parameters$clustering$resolution,".png"),
+         plot     = p631.2,
+         device   = "png",
+         height   = 6,
+         width    = 16,
+         bg       = "white")
+  ggsave(filename = paste0(dirs$images,"d21_WNNinALL_umap_",d21@misc$WNN_parameters$clustering$resolution,".png"),
+         plot     = p631.3,
+         device   = "png",
+         height   = 6,
+         width    = 16,
+         bg       = "white")
+}
+```
+
+```{r 6.3.2 Save Seurat Object as .rds file 3, include=FALSE}
+if(save.rds){
+  saveRDS(d21, file = paste0(dirs$processed,"d21_Seurat3_clustered.rds"))
+}
+```
+
+```{r 6.3.3}
+sessionInfo()
+```
+
